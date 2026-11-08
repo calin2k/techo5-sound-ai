@@ -194,7 +194,7 @@ th { color: var(--muted); font-weight: 500; }
 <div class="wrap">
   <header>
     <div>
-      <h1>Room Sound AI Add-On</h1>
+      <h1>Room Sound AI Add-On <span style="font-size:12px;font-weight:500;color:var(--muted)">{{.Status.Version}}</span></h1>
       <div class="sub">On-device Google YAMNet (521 AudioSet classes) for {{.Config.DeviceName}}</div>
     </div>
     <span id="run-badge" class="badge {{if .Status.Running}}ok{{else}}warn{{end}}">

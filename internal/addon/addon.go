@@ -28,6 +28,7 @@ import (
 )
 
 const (
+	Version       = "v1.1.0"
 	WindowSamples = 15600 // 975 ms at 16 kHz
 	HopSamples    = 7680  // 480 ms hop (~50% overlap)
 
@@ -55,6 +56,7 @@ type Event struct {
 }
 
 type Status struct {
+	Version        string   `json:"version"`
 	ModelReady     bool     `json:"model_ready"`
 	ModelSize      int64    `json:"model_size"`
 	Running        bool     `json:"running"`
@@ -621,6 +623,7 @@ func (d *Daemon) Status() Status {
 	recent := make([]Event, len(d.recent))
 	copy(recent, d.recent)
 	return Status{
+		Version:        Version,
 		ModelReady:     d.engLoaded && modelSize > 1024,
 		ModelSize:      modelSize,
 		Running:        d.engLoaded && d.cfg.Enabled,

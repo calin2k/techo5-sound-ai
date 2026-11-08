@@ -39,7 +39,13 @@ func main() {
 	modelPath := flag.String("model", addon.DefaultModelPath, "path to yamnet.tflite model")
 	sockPath := flag.String("sock", asp.DefaultSocketPath, "Unix datagram socket path for PCM frames")
 	origASP := flag.String("orig-asp", defaultOrigASP, "optional upstream external-asp binary to chain")
+	versionFlag := flag.Bool("version", false, "print version and exit")
 	flag.Parse()
+
+	if *versionFlag {
+		fmt.Println("techo5-sound-ai " + addon.Version)
+		return
+	}
 
 	if (isASP || *aspFlag) && !*daemonFlag {
 		ensureDaemonStarted(*sockPath)
