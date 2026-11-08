@@ -1,0 +1,45 @@
+name: Release
+
+on:
+  push:
+    tags:
+      - 'v*'
+
+permissions:
+  contents: write
+
+jobs:
+  release:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-go@v5
+        with:
+          go-version: '1.24.x'
+
+      - name: Verify Tests & QEMU ARMv7 Assembly
+        run: |
+          go vet ./...
+          go test -race -v ./...
+          sudo apt-get update && sudo apt-get install -y --no-install-recommends qemu-user
+          CGO_ENABLED=0 GOOS=linux GOARCH=arm GOARM=7 go test -c -o sound-arm.test ./internal/sound
+          qemu-arm ./sound-arm.test -test.v -test.run=TestDot4I8BoundaryAndTailLengths
+          rm -f sound-arm.test
+
+      - name: Build Release Binaries & SHA256SUMS
+        run: |
+          CGO_ENABLED=0 GOOS=linux GOARCH=arm GOARM=7 go build -tags nethttpomithttp2 -trimpath -ldflags="-s -w" -o techo5-sound-ai-linux-arm ./cmd/techo5-sound-ai
+          CGO_ENABLED=0 GOOS=linux GOARCH=arm64 go build -tags nethttpomithttp2 -trimpath -ldflags="-s -w" -o techo5-sound-ai-linux-arm64 ./cmd/techo5-sound-ai
+          sha256sum techo5-sound-ai-linux-arm techo5-sound-ai-linux-arm64 > SHA256SUMS
+          cat SHA256SUMS
+
+      - name: Publish GitHub Release Assets
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          if gh release view "${GITHUB_REF_NAME}" >/dev/null 2>&1; then
+            gh release upload "${GITHUB_REF_NAME}" techo5-sound-ai-linux-arm techo5-sound-ai-linux-arm64 SHA256SUMS --clobber
+          else
+            gh release create "${GITHUB_REF_NAME}" techo5-sound-ai-linux-arm techo5-sound-ai-linux-arm64 SHA256SUMS --generate-notes
+          fi

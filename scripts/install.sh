@@ -7,6 +7,7 @@
 set -eu
 
 REPO_RELEASE_URL="https://github.com/calin2k/techo5-sound-ai/releases/latest/download/techo5-sound-ai-linux-arm"
+REPO_SHA256_URL="https://github.com/calin2k/techo5-sound-ai/releases/latest/download/SHA256SUMS"
 YAMNET_URL="https://storage.googleapis.com/mediapipe-models/audio_classifier/yamnet/float32/1/yamnet.tflite"
 
 install_on_device() {
@@ -81,6 +82,19 @@ fi
 mkdir -p /data/techo5-sound-ai
 echo "Downloading latest techo5-sound-ai binary..."
 wget -O /data/techo5-sound-ai/techo5-sound-ai.new "$REPO_RELEASE_URL"
+if command -v sha256sum >/dev/null 2>&1 && wget -qO /tmp/techo5-sound-ai.sha256 "$REPO_SHA256_URL" 2>/dev/null; then
+	expected=$(awk '/techo5-sound-ai-linux-arm$/ {print $1}' /tmp/techo5-sound-ai.sha256)
+	rm -f /tmp/techo5-sound-ai.sha256
+	if [ -n "$expected" ]; then
+		actual=$(sha256sum /data/techo5-sound-ai/techo5-sound-ai.new | awk '{print $1}')
+		if [ "$actual" != "$expected" ]; then
+			rm -f /data/techo5-sound-ai/techo5-sound-ai.new
+			echo "ERROR: SHA-256 mismatch (expected $expected, got $actual)" >&2
+			exit 1
+		fi
+		echo "SHA-256 verified: $actual"
+	fi
+fi
 chmod 700 /data/techo5-sound-ai/techo5-sound-ai.new
 mv -f /data/techo5-sound-ai/techo5-sound-ai.new /data/techo5-sound-ai/techo5-sound-ai
 install_on_device

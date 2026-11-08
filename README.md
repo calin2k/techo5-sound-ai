@@ -23,7 +23,7 @@ When you flash [TECHO5](https://github.com/HuskerMinion/techo5) onto an Amazon E
 
 - **Zero Cloud, Zero External Dependencies:** Runs Google's `yamnet.tflite` (`3.94 MiB`, `521` classes mapped into `21` household categories such as `Doorbell`, `Baby cry`, `Dog`, `Cat`, `Glass breaking`, `Siren`, `Smoke / fire alarm`, `Appliance beep`, `Knock`, `Cough`) directly on the device CPU. No audio or telemetry ever leaves your LAN.
 - **Non-Intrusive `ASP1` Audio Tee:** Hooks into `/data/techo5-linux/external-asp/bin/external-asp`. If you already use an upstream `external-asp` binary, `techo5-sound-ai` preserves it as `external-asp.orig`, chains to it transparently, and tees `16 kHz` mono PCM frames over a non-blocking Unix datagram socket (`/run/techo5-sound-ai.sock`). If no upstream `external-asp` exists, it performs boxcar anti-aliased `48 kHz -> 16 kHz` decimation and 64-tap NLMS acoustic echo cancellation in **`8.2 µs` per `20 ms` frame** with **`0` heap allocations**.
-- **Turnkey Home Assistant Integration:** Built-in **MQTT v3.1.1 client with Home Assistant Auto-Discovery** (automatically registers `sensor.<device>_room_sound` and `sensor.<device>_last_sound_alert`), plus direct **Home Assistant Webhook** and **REST Service** (`notify.*`, `persistent_notification.create`) push alerts and a self-contained Web UI on port `:8182`.
+- **Turnkey Home Assistant Integration:** Built-in **persistent MQTT v3.1.1 client with LWT availability (`online`/`offline`) and Home Assistant Auto-Discovery** (automatically registers `sensor.<device>_room_sound` and `sensor.<device>_last_sound_alert`), plus direct **Home Assistant Webhook** and **REST Service** (`notify.*`, `persistent_notification.create`) push alerts, per-category sensitivity presets, in-RAM last-alert audio playback (`/api/last-alert.wav`), and a self-contained Web UI on port `:8182`.
 
 ### Honest Limitations (What It Is Not)
 - **Not a life-safety device:** Microphone placement, room acoustics, and background media playback affect classification confidence.
@@ -70,8 +70,8 @@ A complete audit of every file added to a TECHO5 device (measured on an Echo Sho
 | **Audio Input (`ASP1`)** | `16–48 kHz`, `1–16` channels, `S16_LE` / `S32_LE` / `F32_LE` -> `16 kHz` mono (`50 Hz` frame rate) |
 | **Idle CPU (Quiet Room)** | **`~1.2%` of 1 core (`~0.3%` total SoC)** via adaptive EMA noise-floor gate (`-68 dBFS` / `+4.5 dB`) |
 | **Active Inference Time** | **`~45 ms`** (`int8` TFLite w/ ARMv7 `MULA` assembly `dot4_arm.s`) / **`~360 ms`** (stock `float32` YAMNet) |
-| **Web UI & REST API** | `http://<device-ip>:8182/` (`GET /api/status`, `POST /api/config`, `POST /api/model/download`, `POST /api/test-notify`) |
-| **Daemon Reliability** | Kernel `flock` liveness probe (`/run/techo5-sound-ai.lock`) + `256 KiB` bounded log rotation |
+| **Web UI & REST API** | `http://<device-ip>:8182/` (`GET /api/status`, `GET /api/last-alert.wav`, `POST /setup/sound`, `POST /setup/sound/model/download`) |
+| **Daemon Reliability** | Kernel `flock` liveness probe (`/run/techo5-sound-ai.lock`) + `256 KiB` bounded log rotation + SHA-256 verified release upgrades |
 
 ---
 

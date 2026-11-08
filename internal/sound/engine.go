@@ -783,30 +783,46 @@ func execConv2D1x1Int8(op *engOp, tin, tw, tout *engTensor) {
 	bias := op.effBias
 	scale := op.effScale
 
-	for p := 0; p < pixels; p++ {
-		inPx := inData[p*icCnt : (p+1)*icCnt]
-		outPx := outData[p*ocCnt : (p+1)*ocCnt]
+	// Tile pixels in chunks of 16 so both the 4 weight rows (<= 4 KiB) and the
+	// input pixel tile (<= 16 KiB) stay resident in the 32 KiB L1 data cache
+	// instead of streaming large weight matrices from DRAM once per pixel.
+	const pTile = 16
+	for pBase := 0; pBase < pixels; pBase += pTile {
+		pEnd := pBase + pTile
+		if pEnd > pixels {
+			pEnd = pixels
+		}
 		oc := 0
 		for ; oc+4 <= ocCnt; oc += 4 {
-			acc := [4]int32{bias[oc], bias[oc+1], bias[oc+2], bias[oc+3]}
+			b0, b1, b2, b3 := bias[oc], bias[oc+1], bias[oc+2], bias[oc+3]
+			s0, s1, s2, s3 := scale[oc], scale[oc+1], scale[oc+2], scale[oc+3]
 			w0 := wData[(oc+0)*icCnt : (oc+1)*icCnt]
 			w1 := wData[(oc+1)*icCnt : (oc+2)*icCnt]
 			w2 := wData[(oc+2)*icCnt : (oc+3)*icCnt]
 			w3 := wData[(oc+3)*icCnt : (oc+4)*icCnt]
-			dot4I8(inPx, w0, w1, w2, w3, &acc)
-			for lane := 0; lane < 4; lane++ {
-				q := roundToNearest(float32(acc[lane])*scale[oc+lane]) + outZP
-				outPx[oc+lane] = int8(clampI32(q, qmin, qmax))
+			for p := pBase; p < pEnd; p++ {
+				inPx := inData[p*icCnt : (p+1)*icCnt]
+				outPx := outData[p*ocCnt : (p+1)*ocCnt]
+				acc := [4]int32{b0, b1, b2, b3}
+				dot4I8(inPx, w0, w1, w2, w3, &acc)
+				outPx[oc+0] = int8(clampI32(roundToNearest(float32(acc[0])*s0)+outZP, qmin, qmax))
+				outPx[oc+1] = int8(clampI32(roundToNearest(float32(acc[1])*s1)+outZP, qmin, qmax))
+				outPx[oc+2] = int8(clampI32(roundToNearest(float32(acc[2])*s2)+outZP, qmin, qmax))
+				outPx[oc+3] = int8(clampI32(roundToNearest(float32(acc[3])*s3)+outZP, qmin, qmax))
 			}
 		}
 		for ; oc < ocCnt; oc++ {
-			a := bias[oc]
+			b0 := bias[oc]
+			s0 := scale[oc]
 			wc := wData[oc*icCnt : (oc+1)*icCnt]
-			for ic := 0; ic < icCnt; ic++ {
-				a += int32(inPx[ic]) * int32(wc[ic])
+			for p := pBase; p < pEnd; p++ {
+				inPx := inData[p*icCnt : (p+1)*icCnt]
+				a := b0
+				for ic := 0; ic < icCnt; ic++ {
+					a += int32(inPx[ic]) * int32(wc[ic])
+				}
+				outData[p*ocCnt+oc] = int8(clampI32(roundToNearest(float32(a)*s0)+outZP, qmin, qmax))
 			}
-			q := roundToNearest(float32(a)*scale[oc]) + outZP
-			outPx[oc] = int8(clampI32(q, qmin, qmax))
 		}
 	}
 }

@@ -583,3 +583,82 @@ func TestDispatchNotificationsMQTTThrottleAndSecurityHeaders(t *testing.T) {
 	}
 }
 
+func TestLastAlertWAVAndPerCategorySensitivityAndImpulsiveSingleHop(t *testing.T) {
+	dir := t.TempDir()
+	d, err := NewDaemon(filepath.Join(dir, "config.json"), filepath.Join(dir, "yamnet.tflite"), "")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer d.Close()
+	h := d.Handler()
+
+	// 1. Before any alert, GET /api/last-alert.wav returns 404
+	rec := httptest.NewRecorder()
+	h.ServeHTTP(rec, httptest.NewRequest(http.MethodGet, "/api/last-alert.wav", nil))
+	if rec.Code != http.StatusNotFound {
+		t.Fatalf("expected 404 before alert audio exists, got %d", rec.Code)
+	}
+
+	// 2. Single-hop impulsive sound (knock at 0.35 >= minConf+0.05) triggers immediately on hop 1
+	// and stores the PCM clip in RAM.
+	pcm := make([]int16, 320)
+	for i := range pcm {
+		pcm[i] = int16(i*50 - 4000)
+	}
+	knockRep := sound.EngineReply{
+		MS:      24.0,
+		RMSDBFS: -22.0,
+		Top:     []sound.TopClass{{ID: 353, Name: "Knock", Score: 0.35}},
+	}
+	d.handleReplyWithPCM(knockRep, pcm)
+
+	st := d.Status()
+	if st.Current != "Knock" || st.LastAlert != "Knock" || !st.HasAlertAudio {
+		t.Fatalf("expected immediate Knock alert with HasAlertAudio=true, got %+v", st)
+	}
+
+	// 3. GET /api/last-alert.wav returns a valid RIFF/WAVE file containing the exact PCM samples
+	rec = httptest.NewRecorder()
+	h.ServeHTTP(rec, httptest.NewRequest(http.MethodGet, "/api/last-alert.wav", nil))
+	if rec.Code != http.StatusOK || rec.Header().Get("Content-Type") != "audio/wav" {
+		t.Fatalf("GET /api/last-alert.wav: code=%d type=%q", rec.Code, rec.Header().Get("Content-Type"))
+	}
+	wav := rec.Body.Bytes()
+	if len(wav) != 44+len(pcm)*2 || string(wav[0:4]) != "RIFF" || string(wav[8:12]) != "WAVE" {
+		t.Fatalf("invalid WAV response len=%d", len(wav))
+	}
+	for i, want := range pcm {
+		got := int16(binary.LittleEndian.Uint16(wav[44+i*2:]))
+		if got != want {
+			t.Fatalf("wav sample[%d] = %d, want %d", i, got, want)
+		}
+	}
+
+	// 4. Per-category sensitivity override via POST /setup/sound
+	form := url.Values{
+		"token":            {d.token},
+		"enabled":          {"1"},
+		"alerts":           {"knock", "doorbell"},
+		"cat_min_knock":    {"0.15"},
+		"cat_min_doorbell": {"0.40"},
+	}
+	req := httptest.NewRequest(http.MethodPost, "/setup/sound", strings.NewReader(form.Encode()))
+	req.Header.Set("Content-Type", "application/x-www-form-urlencoded")
+	rec = httptest.NewRecorder()
+	h.ServeHTTP(rec, req)
+	cfg := d.Config()
+	if cfg.CategoryMin["knock"] != 0.15 || cfg.CategoryMin["doorbell"] != 0.40 {
+		t.Fatalf("expected CategoryMin overrides to be saved, got %+v", cfg.CategoryMin)
+	}
+
+	// Resetting cat_min_knock to "default" removes the override
+	form.Set("cat_min_knock", "default")
+	req = httptest.NewRequest(http.MethodPost, "/setup/sound", strings.NewReader(form.Encode()))
+	req.Header.Set("Content-Type", "application/x-www-form-urlencoded")
+	rec = httptest.NewRecorder()
+	h.ServeHTTP(rec, req)
+	if _, exists := d.Config().CategoryMin["knock"]; exists {
+		t.Fatalf("expected knock override to be deleted on 'default', got %+v", d.Config().CategoryMin)
+	}
+}
+

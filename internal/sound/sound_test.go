@@ -10,6 +10,7 @@ import (
 	"os"
 	"path/filepath"
 	"strings"
+	"sync"
 	"testing"
 	"time"
 )
@@ -742,6 +743,111 @@ func BenchmarkScore(b *testing.B) {
 		if _, err := eng.Score(pcm); err != nil {
 			b.Fatal(err)
 		}
+	}
+}
+
+func TestClassifyWithConfigPerCategoryOverrides(t *testing.T) {
+	top := []TopClass{{ID: 353, Name: "Knock", Score: 0.16}}
+	// Default minConf=0.25 requires >=0.22 for knock -> Quiet
+	if det := ClassifyWithConfig(top, Config{MinConfidence: 0.25}); det.Category != "quiet" {
+		t.Fatalf("expected Quiet at default 0.25, got %+v", det)
+	}
+	// With CategoryMin["knock"] = 0.15, knock at 0.16 is detected
+	sc := Config{
+		MinConfidence: 0.25,
+		CategoryMin:   map[string]float64{"knock": 0.15},
+	}
+	if det := ClassifyWithConfig(top, sc); det.Category != "knock" {
+		t.Fatalf("expected knock with CategoryMin override 0.15, got %+v", det)
+	}
+}
+
+func TestPersistentMQTTClientLWTAndConnectionReuse(t *testing.T) {
+	ln, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer ln.Close()
+
+	type rxPub struct {
+		topic   string
+		payload string
+		retain  bool
+	}
+	var mu sync.Mutex
+	var pubs []rxPub
+	var connects int
+
+	go func() {
+		for {
+			conn, err := ln.Accept()
+			if err != nil {
+				return
+			}
+			mu.Lock()
+			connects++
+			mu.Unlock()
+			go func(c net.Conn) {
+				defer c.Close()
+				_ = c.SetDeadline(time.Now().Add(3 * time.Second))
+				hdr, _, err := readMQTTTestPacket(c)
+				if err != nil || hdr != 0x10 {
+					return
+				}
+				_, _ = c.Write([]byte{0x20, 0x02, 0x00, 0x00})
+				for {
+					h, b, err := readMQTTTestPacket(c)
+					if err != nil || h == 0xe0 {
+						return
+					}
+					if h&0xf0 == 0x30 {
+						tlen := int(b[0])<<8 | int(b[1])
+						mu.Lock()
+						pubs = append(pubs, rxPub{
+							topic:   string(b[2 : 2+tlen]),
+							payload: string(b[2+tlen:]),
+							retain:  h&0x01 != 0,
+						})
+						mu.Unlock()
+					}
+				}
+			}(conn)
+		}
+	}()
+
+	cli := NewMQTTClient(nil)
+	sc := Config{
+		MQTTBroker:    ln.Addr().String(),
+		MQTTUser:      "user",
+		MQTTPass:      "pass",
+		MQTTDiscovery: true,
+	}
+	det := Detection{Category: "knock", Label: "Knock", RawClass: "Knock", Confidence: 0.55, Actionable: true}
+	rep := EngineReply{MS: 22.0, RMSDBFS: -25.0}
+
+	// 1st publish connects, sends birth "online", discovery, state, event, last_alert, alert_event
+	if err := cli.Publish(sc, "Hall Show", det, rep, true, true); err != nil {
+		t.Fatalf("1st Publish: %v", err)
+	}
+	// 2nd publish reuses the exact same TCP connection without reconnecting
+	if err := cli.Publish(sc, "Hall Show", det, rep, false, false); err != nil {
+		t.Fatalf("2nd Publish: %v", err)
+	}
+	// Close publishes retained "offline" availability and disconnects
+	_ = cli.Close()
+	time.Sleep(30 * time.Millisecond)
+
+	mu.Lock()
+	defer mu.Unlock()
+	if connects != 1 {
+		t.Fatalf("expected persistent client to reuse 1 TCP connection across 2 publishes, got %d connects", connects)
+	}
+	if len(pubs) == 0 || pubs[0].topic != "techo5/hall_show/sound/availability" || pubs[0].payload != "online" || !pubs[0].retain {
+		t.Fatalf("expected 1st publish to be retained online availability, got %+v", pubs)
+	}
+	last := pubs[len(pubs)-1]
+	if last.topic != "techo5/hall_show/sound/availability" || last.payload != "offline" || !last.retain {
+		t.Fatalf("expected final publish on Close() to be retained offline availability, got %+v", last)
 	}
 }
 

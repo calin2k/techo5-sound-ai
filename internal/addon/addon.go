@@ -28,7 +28,7 @@ import (
 )
 
 const (
-	Version       = "v1.2.1"
+	Version       = "v1.3.0"
 	WindowSamples = 15600 // 975 ms at 16 kHz
 	HopSamples    = 7680  // 480 ms hop (~50% overlap)
 
@@ -71,6 +71,7 @@ type Status struct {
 	InferenceMS    float64  `json:"inference_ms"`
 	LastAlert      string   `json:"last_alert"`
 	LastAlertAt    string   `json:"last_alert_at"`
+	HasAlertAudio  bool     `json:"has_alert_audio"`
 	LastNotifyErr  string   `json:"last_notify_err"`
 	Recent         []Event  `json:"recent"`
 	AlertChoices   []string `json:"-"`
@@ -106,6 +107,7 @@ type Daemon struct {
 	inferenceMS   float64
 	lastAlert     string
 	lastAlertAt   time.Time
+	lastAlertPCM  []int16
 	lastAlertTime map[string]time.Time
 	lastNotifyErr string
 	recent        []Event
@@ -122,6 +124,7 @@ type Daemon struct {
 	notifyCh    chan notifyJob
 	httpClient  *http.Client
 	mqttDial    func(network, addr string, timeout time.Duration) (net.Conn, error)
+	mqttClient  *sound.MQTTClient
 	modelURL    string
 }
 
@@ -150,6 +153,12 @@ func NewDaemon(cfgPath, modelPath, sockPath string) (*Daemon, error) {
 		httpClient:    &http.Client{Timeout: 6 * time.Second},
 		modelURL:      DefaultModelURL,
 	}
+	d.mqttClient = sound.NewMQTTClient(func(network, addr string, timeout time.Duration) (net.Conn, error) {
+		if d.mqttDial != nil {
+			return d.mqttDial(network, addr, timeout)
+		}
+		return net.DialTimeout(network, addr, timeout)
+	})
 	_ = d.loadConfig()
 	d.adoptLegacyModel()
 	_ = d.ReloadModel()
@@ -272,6 +281,9 @@ func (d *Daemon) ReloadModel() error {
 }
 
 func (d *Daemon) Close() {
+	if d.mqttClient != nil {
+		_ = d.mqttClient.Close()
+	}
 	d.engMu.Lock()
 	eng := d.eng
 	d.eng = nil
@@ -421,7 +433,7 @@ func (d *Daemon) Run(ctx context.Context) error {
 			if !ok || err != nil {
 				continue
 			}
-			d.handleReply(rep)
+			d.handleReplyWithPCM(rep, win)
 		}
 	}
 }
@@ -458,6 +470,21 @@ func (d *Daemon) shouldScoreHop(hopDB float64) bool {
 }
 
 func (d *Daemon) handleReply(rep sound.EngineReply) {
+	d.handleReplyWithPCM(rep, nil)
+}
+
+func isImmediateSingleHop(cat string, conf, minConf float64) bool {
+	switch cat {
+	case "smoke_alarm", "glass", "siren", "doorbell":
+		return true
+	case "knock", "finger_snap", "clapping", "sneeze":
+		// Impulsive transient sounds typically last 100-250 ms (a single 480 ms hop).
+		return conf >= minConf+0.05
+	}
+	return false
+}
+
+func (d *Daemon) handleReplyWithPCM(rep sound.EngineReply, pcm []int16) {
 	d.mu.RLock()
 	sc := d.cfg
 	d.mu.RUnlock()
@@ -471,7 +498,7 @@ func (d *Daemon) handleReply(rep sound.EngineReply) {
 		cooldown = 15 * time.Second
 	}
 
-	det := sound.ClassifyWithMin(rep.Top, minConf)
+	det := sound.ClassifyWithConfig(rep.Top, sc)
 
 	d.mu.Lock()
 	if det.Category == "quiet" {
@@ -501,8 +528,7 @@ func (d *Daemon) handleReply(rep sound.EngineReply) {
 		d.streak = 1
 	}
 
-	urgent := det.Category == "smoke_alarm" || det.Category == "glass" || det.Category == "siren"
-	if !urgent && det.Confidence < 0.45 && d.streak < 2 {
+	if !isImmediateSingleHop(det.Category, det.Confidence, minConf) && det.Confidence < 0.45 && d.streak < 2 {
 		d.rmsDBFS = math.Round(rep.RMSDBFS*10) / 10
 		d.inferenceMS = math.Round(rep.MS*10) / 10
 		d.mu.Unlock()
@@ -525,6 +551,14 @@ func (d *Daemon) handleReply(rep sound.EngineReply) {
 			d.lastAlertTime[det.Category] = now
 			d.lastAlert = det.Label
 			d.lastAlertAt = now
+			if len(pcm) > 0 {
+				if cap(d.lastAlertPCM) < len(pcm) {
+					d.lastAlertPCM = make([]int16, len(pcm))
+				} else {
+					d.lastAlertPCM = d.lastAlertPCM[:len(pcm)]
+				}
+				copy(d.lastAlertPCM, pcm)
+			}
 		}
 	}
 	d.recordEventLocked(now, det, rep.RMSDBFS, isAlert)
@@ -591,7 +625,13 @@ func (d *Daemon) dispatchNotifications(sc sound.Config, det sound.Detection, rep
 	}
 	mqttOK := false
 	if strings.TrimSpace(sc.MQTTBroker) != "" && (isAlert || sc.MQTTAllSounds) {
-		if err := sound.PublishMQTT(d.mqttDial, sc, devName, det, rep, isAlert, includeDiscovery); err != nil {
+		var err error
+		if d.mqttClient != nil {
+			err = d.mqttClient.Publish(sc, devName, det, rep, isAlert, includeDiscovery)
+		} else {
+			err = sound.PublishMQTT(d.mqttDial, sc, devName, det, rep, isAlert, includeDiscovery)
+		}
+		if err != nil {
 			notifyErr = "MQTT: " + err.Error()
 			log.Printf("WARN MQTT publish failed err=%v", err)
 		} else {
@@ -638,6 +678,7 @@ func (d *Daemon) Status() Status {
 		InferenceMS:    d.inferenceMS,
 		LastAlert:      d.lastAlert,
 		LastAlertAt:    alertAt,
+		HasAlertAudio:  len(d.lastAlertPCM) > 0,
 		LastNotifyErr:  d.lastNotifyErr,
 		Recent:         recent,
 	}
@@ -648,6 +689,7 @@ func (d *Daemon) Handler() http.Handler {
 	mux := http.NewServeMux()
 	mux.HandleFunc("GET /", d.handleIndex)
 	mux.HandleFunc("GET /api/status", d.handleAPIStatus)
+	mux.HandleFunc("GET /api/last-alert.wav", d.handleLastAlertWAV)
 	mux.HandleFunc("POST /setup/sound", d.handleSaveConfig)
 	mux.HandleFunc("POST /setup/sound/test", d.handleTestNotify)
 	mux.HandleFunc("POST /setup/sound/model/download", d.handleModelDownload)
@@ -674,6 +716,40 @@ func (d *Daemon) checkToken(w http.ResponseWriter, r *http.Request) bool {
 func (d *Daemon) handleAPIStatus(w http.ResponseWriter, r *http.Request) {
 	w.Header().Set("Content-Type", "application/json")
 	_ = json.NewEncoder(w).Encode(d.Status())
+}
+
+func (d *Daemon) handleLastAlertWAV(w http.ResponseWriter, r *http.Request) {
+	d.mu.RLock()
+	n := len(d.lastAlertPCM)
+	if n == 0 {
+		d.mu.RUnlock()
+		http.NotFound(w, r)
+		return
+	}
+	pcm := make([]int16, n)
+	copy(pcm, d.lastAlertPCM)
+	d.mu.RUnlock()
+
+	dataBytes := uint32(n * 2)
+	buf := make([]byte, 44+dataBytes)
+	copy(buf[0:4], "RIFF")
+	binary.LittleEndian.PutUint32(buf[4:8], 36+dataBytes)
+	copy(buf[8:12], "WAVE")
+	copy(buf[12:16], "fmt ")
+	binary.LittleEndian.PutUint32(buf[16:20], 16)    // PCM fmt chunk size
+	binary.LittleEndian.PutUint16(buf[20:22], 1)     // AudioFormat = 1 (PCM)
+	binary.LittleEndian.PutUint16(buf[22:24], 1)     // NumChannels = 1 (mono)
+	binary.LittleEndian.PutUint32(buf[24:28], 16000) // SampleRate = 16000 Hz
+	binary.LittleEndian.PutUint32(buf[28:32], 32000) // ByteRate = 16000 * 2
+	binary.LittleEndian.PutUint16(buf[32:34], 2)     // BlockAlign = 2
+	binary.LittleEndian.PutUint16(buf[34:36], 16)    // BitsPerSample = 16
+	copy(buf[36:40], "data")
+	binary.LittleEndian.PutUint32(buf[40:44], dataBytes)
+	for i, s := range pcm {
+		binary.LittleEndian.PutUint16(buf[44+i*2:], uint16(s))
+	}
+	w.Header().Set("Content-Type", "audio/wav")
+	_, _ = w.Write(buf)
 }
 
 func (d *Daemon) handleSaveConfig(w http.ResponseWriter, r *http.Request) {
@@ -716,6 +792,28 @@ func (d *Daemon) handleSaveConfig(w http.ResponseWriter, r *http.Request) {
 	}
 	if next.MQTTPass == "" && r.FormValue("mqtt_clear_pass") != "1" {
 		next.MQTTPass = cur.MQTTPass
+	}
+	if len(cur.CategoryMin) > 0 {
+		next.CategoryMin = make(map[string]float64, len(cur.CategoryMin))
+		for k, v := range cur.CategoryMin {
+			next.CategoryMin[k] = v
+		}
+	}
+	for _, ch := range sound.AlertChoices {
+		raw := strings.TrimSpace(r.FormValue("cat_min_" + ch.Category))
+		if raw == "" {
+			continue
+		}
+		if raw == "default" {
+			delete(next.CategoryMin, ch.Category)
+			continue
+		}
+		if v, err := strconv.ParseFloat(raw, 64); err == nil && v >= 0.05 && v <= 0.95 {
+			if next.CategoryMin == nil {
+				next.CategoryMin = make(map[string]float64)
+			}
+			next.CategoryMin[ch.Category] = v
+		}
 	}
 
 	if err := d.saveConfig(next); err != nil {

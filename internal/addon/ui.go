@@ -128,7 +128,11 @@ func (d *Daemon) handleIndex(w http.ResponseWriter, r *http.Request) {
 	b.WriteString(`</div></div>`)
 	b.WriteString(`<div class="stat"><div class="k">Last alert</div><div class="v" id="st-alert">`)
 	b.WriteString(lastAlertText)
-	b.WriteString(`</div></div>`)
+	b.WriteString(`</div><audio id="alert-audio" controls preload="none" src="/api/last-alert.wav" style="width:100%;height:28px;margin-top:6px;`)
+	if !st.HasAlertAudio {
+		b.WriteString(`display:none`)
+	}
+	b.WriteString(`"></audio></div>`)
 	b.WriteString(`<div class="stat"><div class="k">Inference latency</div><div class="v" id="st-ms">`)
 	b.WriteString(infText)
 	b.WriteString(`</div></div></div><div id="recent-wrap" style="margin-top:14px">`)
@@ -187,15 +191,43 @@ func (d *Daemon) handleIndex(w http.ResponseWriter, r *http.Request) {
 	b.WriteString(`</div><div style="margin-top:8px;font-weight:500">Alert on these sounds:</div><div class="checks">`)
 
 	for _, ch := range sound.AlertChoices {
-		b.WriteString(`<label><input type="checkbox" name="alerts" value="`)
-		b.WriteString(escHTML(ch.Category))
+		catEsc := escHTML(ch.Category)
+		curOverride := 0.0
+		if cfg.CategoryMin != nil {
+			curOverride = cfg.CategoryMin[ch.Category]
+		}
+		b.WriteString(`<div style="display:flex;align-items:center;justify-content:space-between;gap:6px;padding:3px 0"><label style="margin:0;padding:0"><input type="checkbox" name="alerts" value="`)
+		b.WriteString(catEsc)
 		b.WriteString(`"`)
 		if sound.AlertEnabled(cfg, ch.Category) {
 			b.WriteString(` checked`)
 		}
 		b.WriteString(`><span>`)
 		b.WriteString(escHTML(ch.Label))
-		b.WriteString(`</span></label>`)
+		b.WriteString(`</span></label><select name="cat_min_`)
+		b.WriteString(catEsc)
+		b.WriteString(`" style="background:#0d1117;color:var(--muted);border:1px solid var(--border);border-radius:4px;font-size:11px;padding:2px 4px">`)
+		b.WriteString(`<option value="default">Default</option>`)
+		for _, opt := range []struct {
+			val   string
+			fval  float64
+			label string
+		}{
+			{"0.15", 0.15, "High (0.15)"},
+			{"0.25", 0.25, "Med (0.25)"},
+			{"0.40", 0.40, "Low (0.40)"},
+		} {
+			b.WriteString(`<option value="`)
+			b.WriteString(opt.val)
+			b.WriteString(`"`)
+			if curOverride > 0 && curOverride >= opt.fval-0.02 && curOverride <= opt.fval+0.02 {
+				b.WriteString(` selected`)
+			}
+			b.WriteString(`>`)
+			b.WriteString(opt.label)
+			b.WriteString(`</option>`)
+		}
+		b.WriteString(`</select></div>`)
 	}
 	b.WriteString(`</div><div class="note"><strong>Safety disclaimer:</strong> Sound classification (including smoke/fire alarm and glass-break recognition) is an experimental, informational convenience feature and is <strong>not</strong> a certified life-safety or UL/EN smoke detection system. Always rely on dedicated, certified smoke and fire alarms.</div></div>`)
 
@@ -416,6 +448,10 @@ setInterval(async () => {
     document.getElementById('st-alert').textContent = s.last_alert
       ? s.last_alert + ' (' + s.last_alert_at + ')'
       : 'None';
+    const aud = document.getElementById('alert-audio');
+    if (aud) {
+      aud.style.display = s.has_alert_audio ? 'block' : 'none';
+    }
     document.getElementById('st-ms').textContent = s.inference_ms > 0
       ? s.inference_ms.toFixed(1) + ' ms / hop'
       : 'Idle (energy gate)';

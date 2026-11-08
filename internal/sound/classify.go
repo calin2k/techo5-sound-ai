@@ -158,9 +158,19 @@ func Classify(top []TopClass) Detection {
 	return ClassifyWithMin(top, 0.25)
 }
 
+// ClassifyWithConfig maps YAMNet's top-k AudioSet scores using sc.MinConfidence and optional
+// per-category threshold overrides in sc.CategoryMin.
+func ClassifyWithConfig(top []TopClass, sc Config) Detection {
+	return classifyInternal(top, sc.MinConfidence, sc.CategoryMin)
+}
+
 // ClassifyWithMin maps YAMNet's top-k AudioSet scores to a room category and label,
 // scaling thresholds relative to minConf (where 0.25 is the calibrated default).
 func ClassifyWithMin(top []TopClass, minConf float64) Detection {
+	return classifyInternal(top, minConf, nil)
+}
+
+func classifyInternal(top []TopClass, minConf float64, catMin map[string]float64) Detection {
 	if len(top) == 0 {
 		return Detection{Category: "quiet", Label: "Quiet"}
 	}
@@ -169,7 +179,7 @@ func ClassifyWithMin(top []TopClass, minConf float64) Detection {
 	} else if minConf > 0.99 {
 		minConf = 0.99
 	}
-	scale := minConf / 0.25
+	baseScale := minConf / 0.25
 
 	// Evaluate actionable and ambient category groups, combining hierarchical siblings.
 	var best Detection
@@ -198,9 +208,15 @@ func ClassifyWithMin(top []TopClass, minConf float64) Detection {
 		if sum > 1.0 {
 			sum = 1.0
 		}
+		effMin := minConf
+		scale := baseScale
+		if custom, ok := catMin[r.category]; ok && !math.IsNaN(custom) && !math.IsInf(custom, 0) && custom >= 0.05 && custom <= 0.95 {
+			effMin = custom
+			scale = custom / 0.25
+		}
 		req := r.minScore * scale
-		if minConf > 0.25 && req < minConf {
-			req = minConf
+		if effMin > 0.25 && req < effMin {
+			req = effMin
 		}
 		rawFloor := 0.14 * scale
 		if rawFloor > req*0.8 {
@@ -232,7 +248,7 @@ func ClassifyWithMin(top []TopClass, minConf float64) Detection {
 	}
 
 	// Fallback: surface any other distinct AudioSet class (e.g., Microwave oven, Thunder, Guitar).
-	fallbackMin := 0.35 * scale
+	fallbackMin := 0.35 * baseScale
 	if minConf > 0.35 && fallbackMin < minConf {
 		fallbackMin = minConf
 	}
