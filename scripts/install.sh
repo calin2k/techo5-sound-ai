@@ -26,9 +26,12 @@ install_on_device() {
 		chmod 700 /data/techo5-linux/external-asp/bin/external-asp.orig
 	fi
 
-	cp -f /data/techo5-sound-ai/techo5-sound-ai /data/techo5-linux/external-asp/bin/external-asp
-	chown 0:0 /data/techo5-sound-ai/techo5-sound-ai /data/techo5-linux/external-asp/bin/external-asp
-	chmod 700 /data/techo5-sound-ai/techo5-sound-ai /data/techo5-linux/external-asp/bin/external-asp
+	chown 0:0 /data/techo5-sound-ai/techo5-sound-ai
+	chmod 700 /data/techo5-sound-ai/techo5-sound-ai
+	ln -f /data/techo5-sound-ai/techo5-sound-ai /data/techo5-linux/external-asp/bin/external-asp 2>/dev/null || \
+		cp -f /data/techo5-sound-ai/techo5-sound-ai /data/techo5-linux/external-asp/bin/external-asp
+	chown 0:0 /data/techo5-linux/external-asp/bin/external-asp
+	chmod 700 /data/techo5-linux/external-asp/bin/external-asp
 
 	# Hook into /data/techo5-linux/rc.local (TECHO5 v1.6.30+)
 	RCLOCAL=/data/techo5-linux/rc.local
@@ -64,7 +67,7 @@ if [ "${1:-}" != "" ]; then
 	BIN="techo5-sound-ai-linux-arm"
 	if [ ! -f "$BIN" ]; then
 		echo "Building $BIN..."
-		GOOS=linux GOARCH=arm GOARM=7 CGO_ENABLED=0 go build -ldflags="-s -w" -o "$BIN" ./cmd/techo5-sound-ai
+		GOOS=linux GOARCH=arm GOARM=7 CGO_ENABLED=0 go build -tags nethttpomithttp2 -trimpath -ldflags="-s -w" -o "$BIN" ./cmd/techo5-sound-ai
 	fi
 	echo "Uploading to root@$HOST:/data/techo5-sound-ai/techo5-sound-ai..."
 	ssh "root@$HOST" 'mkdir -p /data/techo5-sound-ai && if [ -f /run/techo5-sound-ai.lock ]; then kill $(cat /run/techo5-sound-ai.lock) 2>/dev/null || true; fi'

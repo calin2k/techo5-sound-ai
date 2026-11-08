@@ -2,68 +2,270 @@ package addon
 
 import (
 	"fmt"
-	"html/template"
 	"net/http"
+	"strings"
 
 	"github.com/calin2k/techo5-sound-ai/internal/sound"
 )
 
-type alertItemView struct {
-	Category string
-	Label    string
-	Checked  bool
-}
-
-type pageView struct {
-	Token        string
-	Msg          string
-	Err          string
-	Status       Status
-	Config       sound.Config
-	ModelSizeKB  int64
-	DefaultTopic string
-	HasHAToken   bool
-	HasMQTTPass  bool
-	AlertChoices []alertItemView
+func escHTML(s string) string {
+	if !strings.ContainsAny(s, "&<>\"'") {
+		return s
+	}
+	var b strings.Builder
+	b.Grow(len(s) + 16)
+	for i := 0; i < len(s); i++ {
+		switch s[i] {
+		case '&':
+			b.WriteString("&amp;")
+		case '<':
+			b.WriteString("&lt;")
+		case '>':
+			b.WriteString("&gt;")
+		case '"':
+			b.WriteString("&#34;")
+		case '\'':
+			b.WriteString("&#39;")
+		default:
+			b.WriteByte(s[i])
+		}
+	}
+	return b.String()
 }
 
 func (d *Daemon) handleIndex(w http.ResponseWriter, r *http.Request) {
 	st := d.Status()
 	cfg := d.Config()
-	choices := make([]alertItemView, 0, len(sound.AlertChoices))
+	msg := r.URL.Query().Get("msg")
+	errMsg := r.URL.Query().Get("err")
+	modelSizeKB := st.ModelSize / 1024
+	defaultTopic := sound.DefaultTopic(cfg, cfg.DeviceName)
+	hasHAToken := cfg.HAToken != ""
+	hasMQTTPass := cfg.MQTTPass != ""
+
+	runBadgeClass := "warn"
+	runBadgeText := "Paused"
+	if st.Running {
+		runBadgeClass = "ok"
+		runBadgeText = "Active"
+	} else if !st.ModelReady {
+		runBadgeText = "Model needed"
+	}
+
+	audioBadgeClass := "warn"
+	audioBadgeText := "Waiting for External ASP stream"
+	if st.AudioConnected {
+		audioBadgeClass = "ok"
+		audioBadgeText = fmt.Sprintf("Mic stream connected (%d frames)", st.FramesReceived)
+	}
+
+	confText := fmt.Sprintf("Floor %.1f dBFS", st.FloorDBFS)
+	if st.Confidence > 0 {
+		confText = fmt.Sprintf("%.0f%% (%.1f dBFS)", st.Confidence*100, st.RMSDBFS)
+	}
+
+	lastAlertText := "None"
+	if st.LastAlert != "" {
+		lastAlertText = escHTML(st.LastAlert) + " (" + escHTML(st.LastAlertAt) + ")"
+	}
+
+	infText := "Idle (energy gate)"
+	if st.InferenceMS > 0 {
+		infText = fmt.Sprintf("%.1f ms / hop", st.InferenceMS)
+	}
+
+	modelBadgeClass := "warn"
+	modelBadgeText := "Not installed"
+	dlBtnText := "Download Google YAMNet (4.0 MB)"
+	if st.ModelReady {
+		modelBadgeClass = "ok"
+		modelBadgeText = fmt.Sprintf("Installed (%d KB)", modelSizeKB)
+		dlBtnText = "Re-download YAMNet (4.0 MB)"
+	}
+
+	var b strings.Builder
+	b.Grow(12288)
+	b.WriteString(indexHeadPrefix)
+	b.WriteString(escHTML(cfg.DeviceName))
+	b.WriteString(indexHeadStyle)
+	b.WriteString(escHTML(st.Version))
+	b.WriteString(`</span></h1><div class="sub">On-device Google YAMNet (521 AudioSet classes) for `)
+	b.WriteString(escHTML(cfg.DeviceName))
+	b.WriteString(`</div></div><span id="run-badge" class="badge `)
+	b.WriteString(runBadgeClass)
+	b.WriteString(`">`)
+	b.WriteString(runBadgeText)
+	b.WriteString(`</span></header>`)
+
+	if msg != "" {
+		b.WriteString(`<div class="banner ok">`)
+		b.WriteString(escHTML(msg))
+		b.WriteString(`</div>`)
+	}
+	if errMsg != "" {
+		b.WriteString(`<div class="banner err">`)
+		b.WriteString(escHTML(errMsg))
+		b.WriteString(`</div>`)
+	}
+	b.WriteString(`<div id="notify-err" class="banner err" style="`)
+	if st.LastNotifyErr == "" {
+		b.WriteString(`display:none`)
+	}
+	b.WriteString(`">`)
+	b.WriteString(escHTML(st.LastNotifyErr))
+	b.WriteString(`</div>`)
+
+	b.WriteString(`<div class="card"><h2><span>Live Watch</span><span id="audio-pill" class="badge `)
+	b.WriteString(audioBadgeClass)
+	b.WriteString(`">`)
+	b.WriteString(audioBadgeText)
+	b.WriteString(`</span></h2><div class="grid2">`)
+	b.WriteString(`<div class="stat"><div class="k">Current sound</div><div class="v" id="st-current">`)
+	b.WriteString(escHTML(st.Current))
+	b.WriteString(`</div></div>`)
+	b.WriteString(`<div class="stat"><div class="k">Confidence / Level</div><div class="v" id="st-conf">`)
+	b.WriteString(confText)
+	b.WriteString(`</div></div>`)
+	b.WriteString(`<div class="stat"><div class="k">Last alert</div><div class="v" id="st-alert">`)
+	b.WriteString(lastAlertText)
+	b.WriteString(`</div></div>`)
+	b.WriteString(`<div class="stat"><div class="k">Inference latency</div><div class="v" id="st-ms">`)
+	b.WriteString(infText)
+	b.WriteString(`</div></div></div><div id="recent-wrap" style="margin-top:14px">`)
+
+	if len(st.Recent) > 0 {
+		b.WriteString(`<table><thead><tr><th>Time</th><th>Sound</th><th>AudioSet class</th><th>Confidence</th><th>Level</th></tr></thead><tbody id="recent-body">`)
+		for _, ev := range st.Recent {
+			b.WriteString(`<tr><td>`)
+			b.WriteString(escHTML(ev.Time))
+			b.WriteString(`</td><td>`)
+			b.WriteString(escHTML(ev.Label))
+			if ev.Alert {
+				b.WriteString(` <span class="badge ok">Alert</span>`)
+			}
+			b.WriteString(`</td><td>`)
+			b.WriteString(escHTML(ev.RawClass))
+			b.WriteString(fmt.Sprintf(`</td><td>%.0f%%</td><td>%.1f dBFS</td></tr>`, ev.Confidence*100, ev.RMSDBFS))
+		}
+		b.WriteString(`</tbody></table>`)
+	}
+	b.WriteString(`</div></div>`)
+
+	escTok := escHTML(d.token)
+	b.WriteString(`<div class="card"><h2><span>YAMNet TFLite Model</span><span class="badge `)
+	b.WriteString(modelBadgeClass)
+	b.WriteString(`">`)
+	b.WriteString(modelBadgeText)
+	b.WriteString(`</span></h2><p style="margin:0 0 10px;color:var(--muted);font-size:13px">Stored on userdata at <code>/data/misc/techo5/yamnet/yamnet.tflite</code> (read-only mmap, &lt; 1 MB RAM, survives TECHO5 OTA updates).</p><div class="btns">`)
+	b.WriteString(`<form method="post" action="/setup/sound/model/download" style="margin:0"><input type="hidden" name="token" value="`)
+	b.WriteString(escTok)
+	b.WriteString(`"><button type="submit" class="primary">`)
+	b.WriteString(dlBtnText)
+	b.WriteString(`</button></form>`)
+	b.WriteString(`<form method="post" action="/setup/sound/model/upload" enctype="multipart/form-data" style="display:flex;gap:8px;align-items:center;margin:0"><input type="hidden" name="token" value="`)
+	b.WriteString(escTok)
+	b.WriteString(`"><input type="file" name="model" accept=".tflite" style="font-size:12px;color:var(--muted)"><button type="submit">Upload .tflite</button></form>`)
+	if st.ModelReady {
+		b.WriteString(`<form method="post" action="/setup/sound/model/remove" style="margin:0"><input type="hidden" name="token" value="`)
+		b.WriteString(escTok)
+		b.WriteString(`"><button type="submit" class="danger">Remove</button></form>`)
+	}
+	b.WriteString(`</div></div>`)
+
+	b.WriteString(`<form method="post" action="/setup/sound"><input type="hidden" name="token" value="`)
+	b.WriteString(escTok)
+	b.WriteString(`"><div class="card"><h2>Classifier &amp; Alert Categories</h2><label style="display:flex;align-items:center;gap:8px;margin-bottom:14px;cursor:pointer"><input type="checkbox" name="enabled" value="1"`)
+	if cfg.Enabled {
+		b.WriteString(` checked`)
+	}
+	b.WriteString(`><strong>Enable on-device room sound classification</strong></label><div class="grid2">`)
+	b.WriteString(`<label class="row"><span class="lbl">Device name</span><input type="text" name="device_name" value="`)
+	b.WriteString(escHTML(cfg.DeviceName))
+	b.WriteString(`"></label>`)
+	b.WriteString(fmt.Sprintf(`<label class="row"><span class="lbl">Minimum confidence (0.05 – 0.95)</span><input type="number" step="0.01" min="0.05" max="0.95" name="min_confidence" value="%.2f"></label>`, cfg.MinConfidence))
+	b.WriteString(fmt.Sprintf(`<label class="row"><span class="lbl">Alert cooldown (seconds)</span><input type="number" min="1" max="3600" name="cooldown_sec" value="%d"></label>`, cfg.CooldownSec))
+	b.WriteString(`</div><div style="margin-top:8px;font-weight:500">Alert on these sounds:</div><div class="checks">`)
+
 	for _, ch := range sound.AlertChoices {
-		choices = append(choices, alertItemView{
-			Category: ch.Category,
-			Label:    ch.Label,
-			Checked:  sound.AlertEnabled(cfg, ch.Category),
-		})
+		b.WriteString(`<label><input type="checkbox" name="alerts" value="`)
+		b.WriteString(escHTML(ch.Category))
+		b.WriteString(`"`)
+		if sound.AlertEnabled(cfg, ch.Category) {
+			b.WriteString(` checked`)
+		}
+		b.WriteString(`><span>`)
+		b.WriteString(escHTML(ch.Label))
+		b.WriteString(`</span></label>`)
 	}
-	v := pageView{
-		Token:        d.token,
-		Msg:          r.URL.Query().Get("msg"),
-		Err:          r.URL.Query().Get("err"),
-		Status:       st,
-		Config:       cfg,
-		ModelSizeKB:  st.ModelSize / 1024,
-		DefaultTopic: sound.DefaultTopic(cfg, cfg.DeviceName),
-		HasHAToken:   cfg.HAToken != "",
-		HasMQTTPass:  cfg.MQTTPass != "",
-		AlertChoices: choices,
+	b.WriteString(`</div><div class="note"><strong>Safety disclaimer:</strong> Sound classification (including smoke/fire alarm and glass-break recognition) is an experimental, informational convenience feature and is <strong>not</strong> a certified life-safety or UL/EN smoke detection system. Always rely on dedicated, certified smoke and fire alarms.</div></div>`)
+
+	b.WriteString(`<div class="card"><h2>Home Assistant Notifications</h2><label class="row"><span class="lbl">Home Assistant Webhook URL (easiest — no token required)</span><input type="text" name="ha_webhook_url" value="`)
+	b.WriteString(escHTML(cfg.HAWebhookURL))
+	b.WriteString(`" placeholder="http://homeassistant.local:8123/api/webhook/techo5_sound"><span class="hint">POSTs JSON with title, message, category, sound, confidence, rms_dbfs, and device whenever an alert fires.</span></label><div class="grid2"><label class="row"><span class="lbl">Home Assistant URL (optional REST service call)</span><input type="text" name="ha_url" value="`)
+	b.WriteString(escHTML(cfg.HAURL))
+	b.WriteString(`" placeholder="http://homeassistant.local:8123"></label><label class="row"><span class="lbl">Notification service</span><input type="text" name="ha_service" value="`)
+	b.WriteString(escHTML(cfg.HAService))
+	b.WriteString(`" placeholder="persistent_notification.create or notify.mobile_app_phone"></label></div><label class="row"><span class="lbl">Long-Lived Access Token `)
+	if hasHAToken {
+		b.WriteString(`(saved — leave blank to keep)`)
 	}
+	b.WriteString(`</span><input type="password" name="ha_token" value="" placeholder="`)
+	if hasHAToken {
+		b.WriteString(`••••••••`)
+	} else {
+		b.WriteString(`eyJhbGciOi...`)
+	}
+	b.WriteString(`"></label>`)
+	if hasHAToken {
+		b.WriteString(`<label style="display:flex;align-items:center;gap:8px;font-size:12px;color:var(--muted)"><input type="checkbox" name="ha_clear_token" value="1"> Clear saved token</label>`)
+	}
+	b.WriteString(`</div>`)
+
+	b.WriteString(`<div class="card"><h2>MQTT &amp; Home Assistant Auto-Discovery</h2><div class="grid2"><label class="row"><span class="lbl">MQTT broker (host or host:port)</span><input type="text" name="mqtt_broker" value="`)
+	b.WriteString(escHTML(cfg.MQTTBroker))
+	b.WriteString(`" placeholder="192.168.1.10:1883"></label><label class="row"><span class="lbl">Topic prefix</span><input type="text" name="mqtt_topic" value="`)
+	b.WriteString(escHTML(cfg.MQTTTopic))
+	b.WriteString(`" placeholder="`)
+	b.WriteString(escHTML(defaultTopic))
+	b.WriteString(`"></label><label class="row"><span class="lbl">MQTT username</span><input type="text" name="mqtt_user" value="`)
+	b.WriteString(escHTML(cfg.MQTTUser))
+	b.WriteString(`"></label><label class="row"><span class="lbl">MQTT password `)
+	if hasMQTTPass {
+		b.WriteString(`(saved — leave blank to keep)`)
+	}
+	b.WriteString(`</span><input type="password" name="mqtt_pass" value="" placeholder="`)
+	if hasMQTTPass {
+		b.WriteString(`••••••••`)
+	}
+	b.WriteString(`"></label></div>`)
+	if hasMQTTPass {
+		b.WriteString(`<label style="display:flex;align-items:center;gap:8px;font-size:12px;color:var(--muted);margin-bottom:8px"><input type="checkbox" name="mqtt_clear_pass" value="1"> Clear saved MQTT password</label>`)
+	}
+	b.WriteString(`<label style="display:flex;align-items:center;gap:8px;margin-top:6px;cursor:pointer"><input type="checkbox" name="mqtt_discovery" value="1"`)
+	if cfg.MQTTDiscovery {
+		b.WriteString(` checked`)
+	}
+	b.WriteString(`><span>Publish Home Assistant MQTT Auto-Discovery sensors (<code>Room sound</code> &amp; <code>Last sound alert</code>)</span></label>`)
+	b.WriteString(`<label style="display:flex;align-items:center;gap:8px;margin-top:6px;cursor:pointer"><input type="checkbox" name="mqtt_all_sounds" value="1"`)
+	if cfg.MQTTAllSounds {
+		b.WriteString(` checked`)
+	}
+	b.WriteString(`><span>Publish ambient sounds (speech, music, etc.) as well as alerts</span></label>`)
+	b.WriteString(`<div class="btns" style="margin-top:16px"><button type="submit" class="primary">Save settings</button><button type="submit" formaction="/setup/sound/test">Send test notification</button></div></div></form></div>`)
+	b.WriteString(indexFooterScript)
+
 	w.Header().Set("Content-Type", "text/html; charset=utf-8")
-	if err := indexTmpl.Execute(w, v); err != nil {
-		http.Error(w, fmt.Sprintf("template: %v", err), http.StatusInternalServerError)
-	}
+	_, _ = w.Write([]byte(b.String()))
 }
 
-var indexTmpl = template.Must(template.New("index").Funcs(template.FuncMap{
-	"mulf": func(a, b float64) float64 { return a * b },
-}).Parse(`<!doctype html>
+const indexHeadPrefix = `<!doctype html>
 <html lang="en">
 <head>
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
-<title>{{.Config.DeviceName}} — Room Sound AI Add-On</title>
+<title>`
+
+const indexHeadStyle = ` — Room Sound AI Add-On</title>
 <style>
 :root {
   --bg: #0f1318;
@@ -194,200 +396,9 @@ th { color: var(--muted); font-weight: 500; }
 <div class="wrap">
   <header>
     <div>
-      <h1>Room Sound AI Add-On <span style="font-size:12px;font-weight:500;color:var(--muted)">{{.Status.Version}}</span></h1>
-      <div class="sub">On-device Google YAMNet (521 AudioSet classes) for {{.Config.DeviceName}}</div>
-    </div>
-    <span id="run-badge" class="badge {{if .Status.Running}}ok{{else}}warn{{end}}">
-      {{if .Status.Running}}Active{{else if not .Status.ModelReady}}Model needed{{else}}Paused{{end}}
-    </span>
-  </header>
+      <h1>Room Sound AI Add-On <span style="font-size:12px;font-weight:500;color:var(--muted)">`
 
-  {{if .Msg}}<div class="banner ok">{{.Msg}}</div>{{end}}
-  {{if .Err}}<div class="banner err">{{.Err}}</div>{{end}}
-  <div id="notify-err" class="banner err" style="{{if not .Status.LastNotifyErr}}display:none{{end}}">{{.Status.LastNotifyErr}}</div>
-
-  <div class="card">
-    <h2>
-      <span>Live Watch</span>
-      <span id="audio-pill" class="badge {{if .Status.AudioConnected}}ok{{else}}warn{{end}}">
-        {{if .Status.AudioConnected}}Mic stream connected ({{.Status.FramesReceived}} frames){{else}}Waiting for External ASP stream{{end}}
-      </span>
-    </h2>
-    <div class="grid2">
-      <div class="stat">
-        <div class="k">Current sound</div>
-        <div class="v" id="st-current">{{.Status.Current}}</div>
-      </div>
-      <div class="stat">
-        <div class="k">Confidence / Level</div>
-        <div class="v" id="st-conf">{{if gt .Status.Confidence 0.0}}{{printf "%.0f%%" (mulf .Status.Confidence 100)}} ({{printf "%.1f" .Status.RMSDBFS}} dBFS){{else}}Floor {{printf "%.1f" .Status.FloorDBFS}} dBFS{{end}}</div>
-      </div>
-      <div class="stat">
-        <div class="k">Last alert</div>
-        <div class="v" id="st-alert">{{if .Status.LastAlert}}{{.Status.LastAlert}} ({{.Status.LastAlertAt}}){{else}}None{{end}}</div>
-      </div>
-      <div class="stat">
-        <div class="k">Inference latency</div>
-        <div class="v" id="st-ms">{{if gt .Status.InferenceMS 0.0}}{{printf "%.1f ms / hop" .Status.InferenceMS}}{{else}}Idle (energy gate){{end}}</div>
-      </div>
-    </div>
-    <div id="recent-wrap" style="margin-top:14px">
-      {{if .Status.Recent}}
-      <table>
-        <thead><tr><th>Time</th><th>Sound</th><th>AudioSet class</th><th>Confidence</th><th>Level</th></tr></thead>
-        <tbody id="recent-body">
-          {{range .Status.Recent}}
-          <tr>
-            <td>{{.Time}}</td>
-            <td>{{.Label}}{{if .Alert}} <span class="badge ok">Alert</span>{{end}}</td>
-            <td>{{.RawClass}}</td>
-            <td>{{printf "%.0f%%" (mulf .Confidence 100)}}</td>
-            <td>{{printf "%.1f dBFS" .RMSDBFS}}</td>
-          </tr>
-          {{end}}
-        </tbody>
-      </table>
-      {{end}}
-    </div>
-  </div>
-
-  <div class="card">
-    <h2>
-      <span>YAMNet TFLite Model</span>
-      <span class="badge {{if .Status.ModelReady}}ok{{else}}warn{{end}}">
-        {{if .Status.ModelReady}}Installed ({{.ModelSizeKB}} KB){{else}}Not installed{{end}}
-      </span>
-    </h2>
-    <p style="margin:0 0 10px;color:var(--muted);font-size:13px">
-      Stored on userdata at <code>/data/misc/techo5/yamnet/yamnet.tflite</code> (read-only mmap, &lt; 1 MB RAM, survives TECHO5 OTA updates).
-    </p>
-    <div class="btns">
-      <form method="post" action="/setup/sound/model/download" style="margin:0">
-        <input type="hidden" name="token" value="{{.Token}}">
-        <button type="submit" class="primary">{{if .Status.ModelReady}}Re-download YAMNet (4.0 MB){{else}}Download Google YAMNet (4.0 MB){{end}}</button>
-      </form>
-      <form method="post" action="/setup/sound/model/upload" enctype="multipart/form-data" style="display:flex;gap:8px;align-items:center;margin:0">
-        <input type="hidden" name="token" value="{{.Token}}">
-        <input type="file" name="model" accept=".tflite" style="font-size:12px;color:var(--muted)">
-        <button type="submit">Upload .tflite</button>
-      </form>
-      {{if .Status.ModelReady}}
-      <form method="post" action="/setup/sound/model/remove" style="margin:0">
-        <input type="hidden" name="token" value="{{.Token}}">
-        <button type="submit" class="danger">Remove</button>
-      </form>
-      {{end}}
-    </div>
-  </div>
-
-  <form method="post" action="/setup/sound">
-    <input type="hidden" name="token" value="{{.Token}}">
-
-    <div class="card">
-      <h2>Classifier &amp; Alert Categories</h2>
-      <label style="display:flex;align-items:center;gap:8px;margin-bottom:14px;cursor:pointer">
-        <input type="checkbox" name="enabled" value="1" {{if .Config.Enabled}}checked{{end}}>
-        <strong>Enable on-device room sound classification</strong>
-      </label>
-      <div class="grid2">
-        <label class="row">
-          <span class="lbl">Device name</span>
-          <input type="text" name="device_name" value="{{.Config.DeviceName}}">
-        </label>
-        <label class="row">
-          <span class="lbl">Minimum confidence (0.05 – 0.95)</span>
-          <input type="number" step="0.01" min="0.05" max="0.95" name="min_confidence" value="{{printf "%.2f" .Config.MinConfidence}}">
-        </label>
-        <label class="row">
-          <span class="lbl">Alert cooldown (seconds)</span>
-          <input type="number" min="1" max="3600" name="cooldown_sec" value="{{.Config.CooldownSec}}">
-        </label>
-      </div>
-
-      <div style="margin-top:8px;font-weight:500">Alert on these sounds:</div>
-      <div class="checks">
-        {{range .AlertChoices}}
-        <label>
-          <input type="checkbox" name="alerts" value="{{.Category}}" {{if .Checked}}checked{{end}}>
-          <span>{{.Label}}</span>
-        </label>
-        {{end}}
-      </div>
-      <div class="note">
-        <strong>Safety disclaimer:</strong> Sound classification (including smoke/fire alarm and glass-break recognition) is an experimental, informational convenience feature and is <strong>not</strong> a certified life-safety or UL/EN smoke detection system. Always rely on dedicated, certified smoke and fire alarms.
-      </div>
-    </div>
-
-    <div class="card">
-      <h2>Home Assistant Notifications</h2>
-      <label class="row">
-        <span class="lbl">Home Assistant Webhook URL (easiest — no token required)</span>
-        <input type="text" name="ha_webhook_url" value="{{.Config.HAWebhookURL}}" placeholder="http://homeassistant.local:8123/api/webhook/techo5_sound">
-        <span class="hint">POSTs JSON with title, message, category, sound, confidence, rms_dbfs, and device whenever an alert fires.</span>
-      </label>
-      <div class="grid2">
-        <label class="row">
-          <span class="lbl">Home Assistant URL (optional REST service call)</span>
-          <input type="text" name="ha_url" value="{{.Config.HAURL}}" placeholder="http://homeassistant.local:8123">
-        </label>
-        <label class="row">
-          <span class="lbl">Notification service</span>
-          <input type="text" name="ha_service" value="{{.Config.HAService}}" placeholder="persistent_notification.create or notify.mobile_app_phone">
-        </label>
-      </div>
-      <label class="row">
-        <span class="lbl">Long-Lived Access Token {{if .HasHAToken}}(saved — leave blank to keep){{end}}</span>
-        <input type="password" name="ha_token" value="" placeholder="{{if .HasHAToken}}••••••••{{else}}eyJhbGciOi...{{end}}">
-      </label>
-      {{if .HasHAToken}}
-      <label style="display:flex;align-items:center;gap:8px;font-size:12px;color:var(--muted)">
-        <input type="checkbox" name="ha_clear_token" value="1"> Clear saved token
-      </label>
-      {{end}}
-    </div>
-
-    <div class="card">
-      <h2>MQTT &amp; Home Assistant Auto-Discovery</h2>
-      <div class="grid2">
-        <label class="row">
-          <span class="lbl">MQTT broker (host or host:port)</span>
-          <input type="text" name="mqtt_broker" value="{{.Config.MQTTBroker}}" placeholder="192.168.1.10:1883">
-        </label>
-        <label class="row">
-          <span class="lbl">Topic prefix</span>
-          <input type="text" name="mqtt_topic" value="{{.Config.MQTTTopic}}" placeholder="{{.DefaultTopic}}">
-        </label>
-        <label class="row">
-          <span class="lbl">MQTT username</span>
-          <input type="text" name="mqtt_user" value="{{.Config.MQTTUser}}">
-        </label>
-        <label class="row">
-          <span class="lbl">MQTT password {{if .HasMQTTPass}}(saved — leave blank to keep){{end}}</span>
-          <input type="password" name="mqtt_pass" value="" placeholder="{{if .HasMQTTPass}}••••••••{{end}}">
-        </label>
-      </div>
-      {{if .HasMQTTPass}}
-      <label style="display:flex;align-items:center;gap:8px;font-size:12px;color:var(--muted);margin-bottom:8px">
-        <input type="checkbox" name="mqtt_clear_pass" value="1"> Clear saved MQTT password
-      </label>
-      {{end}}
-      <label style="display:flex;align-items:center;gap:8px;margin-top:6px;cursor:pointer">
-        <input type="checkbox" name="mqtt_discovery" value="1" {{if .Config.MQTTDiscovery}}checked{{end}}>
-        <span>Publish Home Assistant MQTT Auto-Discovery sensors (<code>Room sound</code> &amp; <code>Last sound alert</code>)</span>
-      </label>
-      <label style="display:flex;align-items:center;gap:8px;margin-top:6px;cursor:pointer">
-        <input type="checkbox" name="mqtt_all_sounds" value="1" {{if .Config.MQTTAllSounds}}checked{{end}}>
-        <span>Publish ambient sounds (speech, music, etc.) as well as alerts</span>
-      </label>
-
-      <div class="btns" style="margin-top:16px">
-        <button type="submit" class="primary">Save settings</button>
-        <button type="submit" formaction="/setup/sound/test">Send test notification</button>
-      </div>
-    </div>
-  </form>
-</div>
-<script>
+const indexFooterScript = `<script>
 function esc(s) {
   const d = document.createElement('div');
   d.textContent = s || '';
@@ -445,4 +456,4 @@ setInterval(async () => {
 </script>
 </body>
 </html>
-`))
+`

@@ -11,7 +11,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
-	"log/slog"
+	"log"
 	"math"
 	"net"
 	"net/http"
@@ -28,7 +28,7 @@ import (
 )
 
 const (
-	Version       = "v1.2.0"
+	Version       = "v1.2.1"
 	WindowSamples = 15600 // 975 ms at 16 kHz
 	HopSamples    = 7680  // 480 ms hop (~50% overlap)
 
@@ -586,14 +586,14 @@ func (d *Daemon) dispatchNotifications(sc sound.Config, det sound.Detection, rep
 	if isAlert && (strings.TrimSpace(sc.HAWebhookURL) != "" || (strings.TrimSpace(sc.HAURL) != "" && strings.TrimSpace(sc.HAService) != "")) {
 		if err := sound.SendHANotification(d.httpClient, sc, devName, det, rep); err != nil {
 			notifyErr = err.Error()
-			slog.Warn("HA notification failed", "err", err)
+			log.Printf("WARN HA notification failed err=%v", err)
 		}
 	}
 	mqttOK := false
 	if strings.TrimSpace(sc.MQTTBroker) != "" && (isAlert || sc.MQTTAllSounds) {
 		if err := sound.PublishMQTT(d.mqttDial, sc, devName, det, rep, isAlert, includeDiscovery); err != nil {
 			notifyErr = "MQTT: " + err.Error()
-			slog.Warn("MQTT publish failed", "err", err)
+			log.Printf("WARN MQTT publish failed err=%v", err)
 		} else {
 			mqttOK = true
 		}

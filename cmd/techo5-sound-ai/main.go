@@ -4,7 +4,7 @@ import (
 	"context"
 	"flag"
 	"fmt"
-	"log/slog"
+	"log"
 	"net"
 	"net/http"
 	"os"
@@ -68,7 +68,7 @@ func main() {
 
 	d, err := addon.NewDaemon(*cfgPath, *modelPath, *sockPath)
 	if err != nil {
-		slog.Error("failed to initialize daemon", "err", err)
+		log.Printf("ERROR failed to initialize daemon err=%v", err)
 		os.Exit(1)
 	}
 	defer d.Close()
@@ -85,14 +85,14 @@ func main() {
 	}
 
 	go func() {
-		slog.Info("techo5-sound-ai listening", "addr", *listenAddr, "sock", *sockPath, "model", *modelPath)
+		log.Printf("INFO techo5-sound-ai listening addr=%s sock=%s model=%s", *listenAddr, *sockPath, *modelPath)
 		if err := srv.ListenAndServe(); err != nil && err != http.ErrServerClosed {
-			slog.Error("HTTP server error", "err", err)
+			log.Printf("ERROR HTTP server error err=%v", err)
 		}
 	}()
 
 	if err := d.Run(ctx); err != nil {
-		slog.Error("daemon loop error", "err", err)
+		log.Printf("ERROR daemon loop error err=%v", err)
 	}
 	shutCtx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
 	defer cancel()
