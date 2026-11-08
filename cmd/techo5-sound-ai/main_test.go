@@ -28,6 +28,10 @@ func TestAcquireLockSingleInstanceAndRotateLog(t *testing.T) {
 	}
 	defer f1.Close()
 
+	if !isDaemonLocked(lockPath) {
+		t.Fatal("expected isDaemonLocked=true while lock is held")
+	}
+
 	// Second concurrent acquireLock on the same file must fail with EWOULDBLOCK.
 	if f2, err := acquireLock(lockPath); err == nil {
 		_ = f2.Close()
@@ -36,6 +40,9 @@ func TestAcquireLockSingleInstanceAndRotateLog(t *testing.T) {
 
 	// Releasing the first lock allows re-acquiring.
 	_ = f1.Close()
+	if isDaemonLocked(lockPath) {
+		t.Fatal("expected isDaemonLocked=false after lock holder closed")
+	}
 	f3, err := acquireLock(lockPath)
 	if err != nil {
 		t.Fatalf("re-acquireLock after close failed: %v", err)

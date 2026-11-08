@@ -309,6 +309,20 @@ func TestProcessor48kHzDecimationAndNLMSEchoCancellation(t *testing.T) {
 	if lastBlockEnergy >= firstBlockEnergy*0.25 {
 		t.Fatalf("expected NLMS echo cancellation to attenuate reference tone: first=%v last=%v", firstBlockEnergy, lastBlockEnergy)
 	}
+
+	// Verify 3-tap boxcar anti-aliasing filter rejects 16 kHz folding tone (+9000, -4500, -4500) at 48 kHz
+	clear(inBuf)
+	triple := [3]int16{9000, -4500, -4500}
+	for f := 0; f < int(frames); f++ {
+		off := f * int(stride)
+		binary.LittleEndian.PutUint16(inBuf[off:], uint16(triple[f%3]))
+	}
+	proc.Process(inBuf, outBuf)
+	for i := 0; i < OutputSamples; i++ {
+		if s := int16(binary.LittleEndian.Uint16(outBuf[i*2:])); s != 0 {
+			t.Fatalf("expected 16 kHz folding tone to be canceled by 3-tap anti-aliasing filter, got sample[%d]=%d", i, s)
+		}
+	}
 }
 
 func TestRunChainedUpstreamSuccessAndFailures(t *testing.T) {

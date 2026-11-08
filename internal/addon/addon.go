@@ -28,7 +28,7 @@ import (
 )
 
 const (
-	Version       = "v1.1.0"
+	Version       = "v1.2.0"
 	WindowSamples = 15600 // 975 ms at 16 kHz
 	HopSamples    = 7680  // 480 ms hop (~50% overlap)
 
@@ -790,7 +790,7 @@ func (d *Daemon) handleModelDownload(w http.ResponseWriter, r *http.Request) {
 		d.redirectMsg(w, r, "err", fmt.Sprintf("Download returned HTTP %d", resp.StatusCode))
 		return
 	}
-	if err := d.installModelReader(io.LimitReader(resp.Body, MaxModelBytes)); err != nil {
+	if err := d.installModelReader(resp.Body); err != nil {
 		d.redirectMsg(w, r, "err", err.Error())
 		return
 	}
@@ -813,7 +813,7 @@ func (d *Daemon) handleModelUpload(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	defer f.Close()
-	if err := d.installModelReader(io.LimitReader(f, MaxModelBytes)); err != nil {
+	if err := d.installModelReader(f); err != nil {
 		d.redirectMsg(w, r, "err", err.Error())
 		return
 	}
@@ -839,12 +839,16 @@ func (d *Daemon) installModelReader(r io.Reader) error {
 	if err != nil {
 		return err
 	}
-	n, err := io.Copy(out, r)
+	n, err := io.Copy(out, io.LimitReader(r, MaxModelBytes+1))
 	_ = out.Sync()
 	_ = out.Close()
 	if err != nil {
 		_ = os.Remove(tmp)
 		return err
+	}
+	if n > MaxModelBytes {
+		_ = os.Remove(tmp)
+		return errors.New("model file exceeds 16 MB limit")
 	}
 	if n < 1024 {
 		_ = os.Remove(tmp)
@@ -856,7 +860,6 @@ func (d *Daemon) installModelReader(r io.Reader) error {
 		return fmt.Errorf("invalid YAMNet .tflite model: %w", err)
 	}
 	eng.Close()
-	d.Close()
 	if err := os.Rename(tmp, d.modelPath); err != nil {
 		_ = os.Remove(tmp)
 		return err

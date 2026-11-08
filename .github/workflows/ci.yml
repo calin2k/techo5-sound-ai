@@ -26,8 +26,13 @@ jobs:
           go test -fuzz=FuzzReadDescriptor -fuzztime=3s ./internal/asp
           go test -fuzz=FuzzExtractSample -fuzztime=3s ./internal/asp
           go test -fuzz=FuzzClassifyWithMin -fuzztime=3s ./internal/sound
+          go test -fuzz=FuzzLoadEngine -fuzztime=3s ./internal/sound
 
-      - name: Cross-Compile ARMv7 Binary (TECHO5)
+      - name: Cross-Compile & Verify ARMv7 Assembly Kernel under QEMU
         run: |
+          sudo apt-get update && sudo apt-get install -y --no-install-recommends qemu-user
+          CGO_ENABLED=0 GOOS=linux GOARCH=arm GOARM=7 go test -c -o sound-arm.test ./internal/sound
+          qemu-arm ./sound-arm.test -test.v -test.run=TestDot4I8BoundaryAndTailLengths
+          rm -f sound-arm.test
           CGO_ENABLED=0 GOOS=linux GOARCH=arm GOARM=7 go build -trimpath -ldflags="-s -w" -o techo5-sound-ai-linux-arm ./cmd/techo5-sound-ai
           ls -lh techo5-sound-ai-linux-arm

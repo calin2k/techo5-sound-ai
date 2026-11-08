@@ -274,22 +274,30 @@ func (p *Processor) Process(in []byte, out []byte) {
 		case RoleMIC:
 			micCount++
 			for i := 0; i < OutputSamples; i++ {
-				f := i * step
-				if uint32(f) >= b.Frames {
-					f = int(b.Frames) - 1
+				var acc int32
+				for s := 0; s < step; s++ {
+					f := i*step + s
+					if uint32(f) >= b.Frames {
+						f = int(b.Frames) - 1
+					}
+					off := f*int(b.Stride) + int(ch.FrameOffset)
+					acc += int32(ExtractSample(raw, off, b.Format, b.ValidBits, b.LSBShift))
 				}
-				off := f*int(b.Stride) + int(ch.FrameOffset)
-				micSum[i] += int32(ExtractSample(raw, off, b.Format, b.ValidBits, b.LSBShift))
+				micSum[i] += acc / int32(step)
 			}
 		case RoleREF:
 			refCount++
 			for i := 0; i < OutputSamples; i++ {
-				f := i * step
-				if uint32(f) >= b.Frames {
-					f = int(b.Frames) - 1
+				var acc int32
+				for s := 0; s < step; s++ {
+					f := i*step + s
+					if uint32(f) >= b.Frames {
+						f = int(b.Frames) - 1
+					}
+					off := f*int(b.Stride) + int(ch.FrameOffset)
+					acc += int32(ExtractSample(raw, off, b.Format, b.ValidBits, b.LSBShift))
 				}
-				off := f*int(b.Stride) + int(ch.FrameOffset)
-				refSum[i] += int32(ExtractSample(raw, off, b.Format, b.ValidBits, b.LSBShift))
+				refSum[i] += acc / int32(step)
 			}
 		}
 	}

@@ -421,9 +421,12 @@ func TestClassifyAllRuleCategoriesAndEdgeCases(t *testing.T) {
 func TestLoadEngineCorruptAndMalformedModels(t *testing.T) {
 	dir := t.TempDir()
 
-	// 1. Non-existent file
+	// 1. Non-existent file or directory (non-regular file)
 	if _, err := LoadEngine(filepath.Join(dir, "missing.tflite")); err == nil {
 		t.Fatal("expected error for missing file")
+	}
+	if _, err := LoadEngine(dir); err == nil {
+		t.Fatal("expected error when passing a directory to LoadEngine")
 	}
 
 	// 2. Various corrupt/malformed payloads

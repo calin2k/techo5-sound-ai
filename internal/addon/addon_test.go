@@ -351,6 +351,9 @@ func TestModelUploadDownloadRemoveAndTestNotifyEndpoints(t *testing.T) {
 	if r3 := uploadMultipart(d.token, make([]byte, 4096)); !strings.Contains(r3.Header().Get("Location"), "err=") {
 		t.Fatalf("upload corrupt model: loc=%q", r3.Header().Get("Location"))
 	}
+	if err := d.installModelReader(bytes.NewReader(make([]byte, MaxModelBytes+16))); err == nil || !strings.Contains(err.Error(), "exceeds") {
+		t.Fatalf("expected oversized model stream to fail with size limit error, got %v", err)
+	}
 
 	// 4. POST /setup/sound/model/download against mock HTTP server (404, corrupt, and valid if present)
 	var dlMode string

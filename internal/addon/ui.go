@@ -295,8 +295,8 @@ th { color: var(--muted); font-weight: 500; }
           <input type="text" name="device_name" value="{{.Config.DeviceName}}">
         </label>
         <label class="row">
-          <span class="lbl">Minimum confidence (0.10 – 0.90)</span>
-          <input type="number" step="0.05" min="0.10" max="0.90" name="min_confidence" value="{{printf "%.2f" .Config.MinConfidence}}">
+          <span class="lbl">Minimum confidence (0.05 – 0.95)</span>
+          <input type="number" step="0.01" min="0.05" max="0.95" name="min_confidence" value="{{printf "%.2f" .Config.MinConfidence}}">
         </label>
         <label class="row">
           <span class="lbl">Alert cooldown (seconds)</span>
@@ -437,6 +437,8 @@ setInterval(async () => {
           (ev.rms_dbfs || 0).toFixed(1) + ' dBFS</td></tr>';
       }
       wrap.innerHTML = '<table><thead><tr><th>Time</th><th>Sound</th><th>AudioSet class</th><th>Confidence</th><th>Level</th></tr></thead><tbody>' + rows + '</tbody></table>';
+    } else if (wrap) {
+      wrap.innerHTML = '';
     }
   } catch (e) {}
 }, 2000);

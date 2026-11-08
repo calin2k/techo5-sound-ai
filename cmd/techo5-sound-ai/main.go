@@ -136,10 +136,23 @@ func rotateLogFile(path string, maxBytes int64) {
 	_ = os.Rename(path, path+".1")
 }
 
-// ensureDaemonStarted spawns the background daemon if the Unix socket does not exist yet
-// (for example on Echo Dot / Echo Spot builds that do not run /data/techo5-linux/rc.local).
+func isDaemonLocked(lockPath string) bool {
+	f, err := os.OpenFile(lockPath, os.O_CREATE|os.O_RDWR, 0600)
+	if err != nil {
+		return false
+	}
+	defer f.Close()
+	if err := syscall.Flock(int(f.Fd()), syscall.LOCK_EX|syscall.LOCK_NB); err != nil {
+		return true
+	}
+	_ = syscall.Flock(int(f.Fd()), syscall.LOCK_UN)
+	return false
+}
+
+// ensureDaemonStarted spawns the background daemon if no live process holds defaultLockFile
+// (including after a SIGKILL where a stale socket file may still exist on disk).
 func ensureDaemonStarted(sockPath string) {
-	if _, err := os.Stat(sockPath); err == nil {
+	if isDaemonLocked(defaultLockFile) {
 		return
 	}
 	bin := defaultDaemonBin
