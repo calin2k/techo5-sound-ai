@@ -890,7 +890,13 @@ func execDWConv2DInt8(op *engOp, tin, tw, tout *engTensor) {
 	inZP, outZP := tin.zp, tout.zp
 	qmin, qmax := op.qmin, op.qmax
 	bias, scale := op.effBias, op.effScale
-	accBuf := make([]int32, ch)
+	var accStack [1024]int32
+	var accBuf []int32
+	if ch <= len(accStack) {
+		accBuf = accStack[:ch]
+	} else {
+		accBuf = make([]int32, ch)
+	}
 
 	for oh := 0; oh < outH; oh++ {
 		for ow := 0; ow < outW; ow++ {

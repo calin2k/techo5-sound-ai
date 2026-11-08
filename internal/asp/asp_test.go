@@ -366,3 +366,54 @@ func TestRunChainedUpstreamSuccessAndFailures(t *testing.T) {
 		t.Fatal("expected error when upstream exits before ready byte")
 	}
 }
+
+func FuzzReadDescriptor(f *testing.F) {
+	f.Add(encodeTestDescriptor(
+		[]Buffer{{Offset: 0, Length: 640, SampleRate: 16000, Frames: 320, Stride: 2, Format: FormatS16, ValidBits: 16, Channels: 1}},
+		[]Channel{{BufferIndex: 0, Role: RoleMIC, FrameOffset: 0}},
+	))
+	f.Add([]byte("ASP1"))
+	f.Fuzz(func(t *testing.T, raw []byte) {
+		desc, err := ReadDescriptor(bytes.NewReader(raw))
+		if err == nil && len(desc.Buffers) == 0 {
+			t.Fatal("ReadDescriptor succeeded with 0 buffers")
+		}
+	})
+}
+
+func FuzzExtractSample(f *testing.F) {
+	f.Add([]byte{0x01, 0x02, 0x03, 0x04}, 0, uint8(FormatS24_3), uint8(24), uint8(0))
+	f.Fuzz(func(t *testing.T, buf []byte, pos int, format, validBits, lsbShift uint8) {
+		_ = ExtractSample(buf, pos, format, validBits, lsbShift)
+	})
+}
+
+func BenchmarkProcessorProcess(b *testing.B) {
+	stride := uint32(12)
+	frames := uint32(320)
+	length := stride * frames
+	descBytes := encodeTestDescriptor(
+		[]Buffer{{
+			Offset: 0, Length: length, SampleRate: 16000, Frames: frames, Stride: stride,
+			Format: FormatS24_3, ValidBits: 24, LSBShift: 0, Channels: 4,
+		}},
+		[]Channel{
+			{BufferIndex: 0, Role: RoleMIC, RoleIndex: 0, FrameOffset: 0},
+			{BufferIndex: 0, Role: RoleMIC, RoleIndex: 1, FrameOffset: 3},
+			{BufferIndex: 0, Role: RoleREF, RoleIndex: 0, FrameOffset: 6},
+			{BufferIndex: 0, Role: RoleREF, RoleIndex: 1, FrameOffset: 9},
+		},
+	)
+	desc, err := ReadDescriptor(bytes.NewReader(descBytes))
+	if err != nil {
+		b.Fatal(err)
+	}
+	proc := NewProcessor(desc)
+	in := make([]byte, length)
+	out := make([]byte, OutputBytes)
+	b.ReportAllocs()
+	b.ResetTimer()
+	for i := 0; i < b.N; i++ {
+		proc.Process(in, out)
+	}
+}

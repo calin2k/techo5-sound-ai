@@ -253,7 +253,11 @@ func ClassifyWithMin(top []TopClass, minConf float64) Detection {
 				name = "Unknown"
 			}
 			cat := strings.ToLower(name)
-			cat = strings.NewReplacer(", ", "_", " ", "_", "(", "", ")", "", "/", "_").Replace(cat)
+			cat = strings.Trim(strings.NewReplacer(", ", "_", " ", "_", "(", "", ")", "", "/", "_").Replace(cat), "_")
+			if cat == "" {
+				cat = "unknown"
+				name = "Unknown"
+			}
 			return Detection{
 				Category:   cat,
 				Label:      name,

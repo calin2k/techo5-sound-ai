@@ -13,6 +13,10 @@ uninstall_on_device() {
 		mv -f /data/techo5-linux/external-asp/bin/external-asp.orig /data/techo5-linux/external-asp/bin/external-asp
 	else
 		rm -f /data/techo5-linux/external-asp/bin/external-asp
+		if [ -f /data/misc/techo5/state.json ] && grep -q '"asp": "external"' /data/misc/techo5/state.json 2>/dev/null; then
+			sed -i 's/"asp": "external"/"asp": "builtin"/' /data/misc/techo5/state.json
+			kill $(pidof techo5) 2>/dev/null || true
+		fi
 	fi
 
 	if [ -f /data/techo5-linux/rc.local ]; then

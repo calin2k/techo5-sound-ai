@@ -23,11 +23,15 @@ const (
 	defaultOrigASP   = "/data/techo5-linux/external-asp/bin/external-asp.orig"
 	defaultLockFile  = "/run/techo5-sound-ai.lock"
 	defaultLogFile   = "/data/techo5-sound-ai/sound-ai.log"
+	maxLogBytes      = 256 << 10
 )
 
+func isASPInvocation(arg0 string) bool {
+	return filepath.Base(arg0) == "external-asp" || arg0 == "/proc/self/fd/3"
+}
+
 func main() {
-	base := filepath.Base(os.Args[0])
-	isASP := base == "external-asp" || os.Args[0] == "/proc/self/fd/3"
+	isASP := isASPInvocation(os.Args[0])
 	aspFlag := flag.Bool("asp", false, "run as TECHO5 External ASP v1 stdin/stdout helper")
 	daemonFlag := flag.Bool("daemon", false, "run as standalone classifier and web UI daemon")
 	listenAddr := flag.String("listen", ":8182", "HTTP listen address for setup and status UI")
@@ -46,6 +50,8 @@ func main() {
 		}
 		return
 	}
+
+	rotateLogFile(defaultLogFile, maxLogBytes)
 
 	lockF, err := acquireLock(defaultLockFile)
 	if err != nil {
@@ -116,6 +122,14 @@ func acquireLock(path string) (*os.File, error) {
 	return f, nil
 }
 
+func rotateLogFile(path string, maxBytes int64) {
+	st, err := os.Stat(path)
+	if err != nil || st.IsDir() || st.Size() <= maxBytes {
+		return
+	}
+	_ = os.Rename(path, path+".1")
+}
+
 // ensureDaemonStarted spawns the background daemon if the Unix socket does not exist yet
 // (for example on Echo Dot / Echo Spot builds that do not run /data/techo5-linux/rc.local).
 func ensureDaemonStarted(sockPath string) {
@@ -127,6 +141,7 @@ func ensureDaemonStarted(sockPath string) {
 		return
 	}
 	_ = os.MkdirAll(filepath.Dir(defaultLogFile), 0700)
+	rotateLogFile(defaultLogFile, maxLogBytes)
 	logF, err := os.OpenFile(defaultLogFile, os.O_CREATE|os.O_WRONLY|os.O_APPEND, 0600)
 	if err != nil {
 		return

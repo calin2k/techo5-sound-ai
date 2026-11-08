@@ -108,6 +108,8 @@ type Daemon struct {
 	lastNotifyErr string
 	recent        []Event
 	mqttDiscSent  bool
+	lastMQTTCat   string
+	lastMQTTTime  time.Time
 	prevCat       string
 	streak        int
 	quietHops     int
@@ -228,6 +230,7 @@ func (d *Daemon) saveConfig(c sound.Config) error {
 	if err := os.WriteFile(tmp, data, 0600); err != nil {
 		return err
 	}
+	_ = os.Chmod(tmp, 0600)
 	if err := os.Rename(tmp, d.cfgPath); err != nil {
 		return err
 	}
@@ -364,7 +367,14 @@ func (d *Daemon) Run(ctx context.Context) error {
 		for {
 			select {
 			case <-ctx.Done():
-				return
+				for {
+					select {
+					case job := <-d.notifyCh:
+						d.dispatchNotifications(job.sc, job.det, job.rep, job.isAlert, job.disc)
+					default:
+						return
+					}
+				}
 			case job := <-d.notifyCh:
 				d.dispatchNotifications(job.sc, job.det, job.rep, job.isAlert, job.disc)
 			}
@@ -517,9 +527,19 @@ func (d *Daemon) handleReply(rep sound.EngineReply) {
 	}
 	d.recordEventLocked(now, det, rep.RMSDBFS, isAlert)
 	disc := !d.mqttDiscSent && strings.TrimSpace(sc.MQTTBroker) != ""
+	shouldNotify := isAlert
+	if !shouldNotify && sc.MQTTAllSounds {
+		if det.Category != d.lastMQTTCat || now.Sub(d.lastMQTTTime) >= 5*time.Second {
+			shouldNotify = true
+		}
+	}
+	if shouldNotify {
+		d.lastMQTTCat = det.Category
+		d.lastMQTTTime = now
+	}
 	d.mu.Unlock()
 
-	if isAlert || sc.MQTTAllSounds {
+	if shouldNotify {
 		job := notifyJob{sc: sc, det: det, rep: rep, isAlert: isAlert, disc: disc}
 		select {
 		case d.notifyCh <- job:
@@ -630,7 +650,14 @@ func (d *Daemon) Handler() http.Handler {
 	mux.HandleFunc("POST /setup/sound/model/download", d.handleModelDownload)
 	mux.HandleFunc("POST /setup/sound/model/upload", d.handleModelUpload)
 	mux.HandleFunc("POST /setup/sound/model/remove", d.handleModelRemove)
-	return mux
+	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		h := w.Header()
+		h.Set("X-Content-Type-Options", "nosniff")
+		h.Set("X-Frame-Options", "DENY")
+		h.Set("Referrer-Policy", "no-referrer")
+		h.Set("Cache-Control", "no-store")
+		mux.ServeHTTP(w, r)
+	})
 }
 
 func (d *Daemon) checkToken(w http.ResponseWriter, r *http.Request) bool {

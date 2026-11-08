@@ -502,3 +502,81 @@ func TestEndToEndDaemonRunStreamingAndConcurrency(t *testing.T) {
 	}
 }
 
+func TestDispatchNotificationsMQTTThrottleAndSecurityHeaders(t *testing.T) {
+	dir := t.TempDir()
+	cfgPath := filepath.Join(dir, "config.json")
+	d, err := NewDaemon(cfgPath, filepath.Join(dir, "yamnet.tflite"), "")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer d.Close()
+
+	// 1. Verify HTTP security and cache-control headers on GET / and GET /api/status
+	rec := httptest.NewRecorder()
+	d.Handler().ServeHTTP(rec, httptest.NewRequest(http.MethodGet, "/api/status", nil))
+	if rec.Header().Get("X-Content-Type-Options") != "nosniff" ||
+		rec.Header().Get("X-Frame-Options") != "DENY" ||
+		rec.Header().Get("Cache-Control") != "no-store" {
+		t.Fatalf("missing security headers: %+v", rec.Header())
+	}
+
+	// 2. Verify saveConfig enforces 0600 file mode on config.json
+	if err := d.saveConfig(sound.Config{
+		Enabled:       true,
+		DeviceName:    "Bedroom Show",
+		MinConfidence: 0.25,
+		CooldownSec:   15,
+		MQTTAllSounds: true,
+	}); err != nil {
+		t.Fatal(err)
+	}
+	if st, err := os.Stat(cfgPath); err != nil || st.Mode().Perm() != 0600 {
+		t.Fatalf("config.json perm = %v, err = %v, want 0600", st.Mode().Perm(), err)
+	}
+
+	// 3. Verify MQTTAllSounds throttling: 2 consecutive high-confidence speech hops within 5s
+	// queue only 1 notification job; switching to music queues a 2nd job immediately.
+	speechRep := sound.EngineReply{
+		MS: 25, RMSDBFS: -20,
+		Top: []sound.TopClass{{ID: 0, Name: "Speech", Score: 0.80}},
+	}
+	musicRep := sound.EngineReply{
+		MS: 25, RMSDBFS: -20,
+		Top: []sound.TopClass{{ID: 132, Name: "Music", Score: 0.80}},
+	}
+	d.handleReply(speechRep)
+	d.handleReply(speechRep)
+	if got := len(d.notifyCh); got != 1 {
+		t.Fatalf("expected 1 queued job for repeated speech hops, got %d", got)
+	}
+	d.handleReply(musicRep)
+	if got := len(d.notifyCh); got != 2 {
+		t.Fatalf("expected 2nd queued job on category change to music, got %d", got)
+	}
+
+	// 4. Test dispatchNotifications error recording and clear on success
+	badCfg := sound.Config{
+		DeviceName:   "Bedroom Show",
+		HAWebhookURL: "ftp://invalid-scheme",
+		MQTTBroker:   "127.0.0.1:1",
+	}
+	det := sound.Detection{Category: "siren", Label: "Siren", Confidence: 0.9, Actionable: true}
+	d.dispatchNotifications(badCfg, det, speechRep, true, true)
+	if d.Status().LastNotifyErr == "" {
+		t.Fatal("expected LastNotifyErr to be recorded when notification fails")
+	}
+
+	okSrv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.WriteHeader(http.StatusOK)
+	}))
+	defer okSrv.Close()
+	okCfg := sound.Config{
+		DeviceName:   "Bedroom Show",
+		HAWebhookURL: okSrv.URL,
+	}
+	d.dispatchNotifications(okCfg, det, speechRep, true, false)
+	if errStr := d.Status().LastNotifyErr; errStr != "" {
+		t.Fatalf("expected LastNotifyErr to clear on success, got %q", errStr)
+	}
+}
+

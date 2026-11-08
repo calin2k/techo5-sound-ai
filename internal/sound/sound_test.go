@@ -640,3 +640,105 @@ func TestSendHANotificationAndConfigHelpersExceptionCases(t *testing.T) {
 	}
 }
 
+func TestDot4I8BoundaryAndTailLengths(t *testing.T) {
+	// Verify dot4I8 across all remainder lengths (n % 4 in {0, 1, 2, 3}) and extreme int8 values (-128, 127).
+	for n := 0; n <= 19; n++ {
+		in := make([]int8, n)
+		w0 := make([]int8, n)
+		w1 := make([]int8, n)
+		w2 := make([]int8, n)
+		w3 := make([]int8, n)
+		for i := 0; i < n; i++ {
+			switch i % 4 {
+			case 0:
+				in[i] = -128
+				w0[i], w1[i], w2[i], w3[i] = -128, 127, -1, 0
+			case 1:
+				in[i] = 127
+				w0[i], w1[i], w2[i], w3[i] = 127, -128, 2, -3
+			case 2:
+				in[i] = -64
+				w0[i], w1[i], w2[i], w3[i] = 33, -44, 55, -66
+			case 3:
+				in[i] = 99
+				w0[i], w1[i], w2[i], w3[i] = -11, 22, -33, 44
+			}
+		}
+		got := [4]int32{10, -20, 30, -40}
+		want := got
+		for i := 0; i < n; i++ {
+			x := int32(in[i])
+			want[0] += x * int32(w0[i])
+			want[1] += x * int32(w1[i])
+			want[2] += x * int32(w2[i])
+			want[3] += x * int32(w3[i])
+		}
+		dot4I8(in, w0, w1, w2, w3, &got)
+		if got != want {
+			t.Fatalf("dot4I8(n=%d) = %v, want %v", n, got, want)
+		}
+	}
+}
+
+func FuzzClassifyWithMin(f *testing.F) {
+	f.Add(393, "Smoke alarm", 0.65, 0.25)
+	f.Add(494, "Silence", 0.99, 0.25)
+	f.Add(420, "Custom sound (test)/1", 0.50, 0.10)
+	f.Add(420, "(", 1.0, 0.25)
+	f.Fuzz(func(t *testing.T, id int, name string, score float64, minConf float64) {
+		det := ClassifyWithMin([]TopClass{{ID: id, Name: name, Score: score}}, minConf)
+		if det.Category == "" || det.Label == "" {
+			t.Fatalf("empty Category or Label returned: %+v", det)
+		}
+		if math.IsNaN(det.Confidence) || math.IsInf(det.Confidence, 0) || det.Confidence < 0 || det.Confidence > 1.0 {
+			t.Fatalf("invalid Confidence %v in %+v", det.Confidence, det)
+		}
+	})
+}
+
+func FuzzLoadEngine(f *testing.F) {
+	f.Add([]byte("short"))
+	hdr := make([]byte, 128)
+	copy(hdr[4:8], "TFL3")
+	hdr[0] = 16
+	f.Add(hdr)
+	f.Fuzz(func(t *testing.T, data []byte) {
+		p := filepath.Join(t.TempDir(), "fuzz.tflite")
+		if err := os.WriteFile(p, data, 0600); err != nil {
+			return
+		}
+		eng, err := LoadEngine(p)
+		if err == nil {
+			eng.Close()
+		}
+	})
+}
+
+func BenchmarkScore(b *testing.B) {
+	var modelPath string
+	for _, p := range []string{os.Getenv("YAMNET_TFLITE"), filepath.Join("..", "..", "..", "sound-ai", "yamnet.tflite")} {
+		if p != "" {
+			if _, err := os.Stat(p); err == nil {
+				modelPath = p
+				break
+			}
+		}
+	}
+	if modelPath == "" {
+		b.Skip("local yamnet.tflite not present; skipping BenchmarkScore")
+	}
+	eng, err := LoadEngine(modelPath)
+	if err != nil {
+		b.Fatal(err)
+	}
+	defer eng.Close()
+	pcm := make([]int16, windowSamples)
+	b.ReportAllocs()
+	b.ResetTimer()
+	for i := 0; i < b.N; i++ {
+		if _, err := eng.Score(pcm); err != nil {
+			b.Fatal(err)
+		}
+	}
+}
+
