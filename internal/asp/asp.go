@@ -18,6 +18,8 @@ import (
 	"net"
 	"os"
 	"os/exec"
+	"syscall"
+	"time"
 )
 
 const (
@@ -99,7 +101,7 @@ func ReadDescriptor(r io.Reader) (Descriptor, error) {
 	}
 	p := HeaderSize
 	for i := range d.Buffers {
-		d.Buffers[i] = Buffer{
+		b := Buffer{
 			Offset:       binary.LittleEndian.Uint32(raw[p:]),
 			Length:       binary.LittleEndian.Uint32(raw[p+4:]),
 			SampleRate:   binary.LittleEndian.Uint32(raw[p+8:]),
@@ -111,22 +113,68 @@ func ReadDescriptor(r io.Reader) (Descriptor, error) {
 			Channels:     raw[p+23],
 			FirstChannel: binary.LittleEndian.Uint16(raw[p+24:]),
 		}
+		if b.Length == 0 || b.SampleRate == 0 || b.Frames == 0 || b.Stride == 0 || b.Channels == 0 {
+			return Descriptor{}, fmt.Errorf("invalid ASP1 buffer[%d] geometry", i)
+		}
+		if uint64(b.Offset)+uint64(b.Length) > uint64(inputSize) {
+			return Descriptor{}, fmt.Errorf("ASP1 buffer[%d] exceeds input size", i)
+		}
+		if formatByteWidth(b.Format) == 0 {
+			return Descriptor{}, fmt.Errorf("unsupported ASP1 buffer[%d] format %d", i, b.Format)
+		}
+		d.Buffers[i] = b
 		p += BufferSize
 	}
+	micChannels := 0
 	for i := range d.Channels {
-		d.Channels[i] = Channel{
+		ch := Channel{
 			BufferIndex: raw[p],
 			Role:        raw[p+1],
 			RoleIndex:   binary.LittleEndian.Uint16(raw[p+2:]),
 			FrameOffset: binary.LittleEndian.Uint32(raw[p+4:]),
 		}
+		if int(ch.BufferIndex) >= len(d.Buffers) {
+			return Descriptor{}, fmt.Errorf("ASP1 channel[%d] buffer index %d out of range", i, ch.BufferIndex)
+		}
+		if ch.Role != RoleMIC && ch.Role != RoleREF {
+			return Descriptor{}, fmt.Errorf("ASP1 channel[%d] unknown role %d", i, ch.Role)
+		}
+		if ch.Role == RoleMIC {
+			micChannels++
+		}
+		b := d.Buffers[ch.BufferIndex]
+		w := uint64(formatByteWidth(b.Format))
+		if uint64(ch.FrameOffset)+w > uint64(b.Stride) ||
+			(uint64(b.Frames)-1)*uint64(b.Stride)+uint64(ch.FrameOffset)+w > uint64(b.Length) {
+			return Descriptor{}, fmt.Errorf("ASP1 channel[%d] frame offset %d out of buffer bounds", i, ch.FrameOffset)
+		}
+		d.Channels[i] = ch
 		p += ChannelSize
+	}
+	if micChannels == 0 {
+		return Descriptor{}, errors.New("ASP1 descriptor has no MIC channels")
 	}
 	return d, nil
 }
 
+func formatByteWidth(format uint8) int {
+	switch format {
+	case FormatS16:
+		return 2
+	case FormatS24_3:
+		return 3
+	case FormatS32:
+		return 4
+	default:
+		return 0
+	}
+}
+
 // ExtractSample reads one channel sample from buf at byte offset pos and scales it to int16.
 func ExtractSample(buf []byte, pos int, format, validBits, lsbShift uint8) int16 {
+	if pos < 0 {
+		return 0
+	}
 	switch format {
 	case FormatS16:
 		if pos+2 > len(buf) {
@@ -201,6 +249,9 @@ func NewProcessor(d Descriptor) *Processor {
 
 // Process converts one ASP1 input block into a 640-byte (320 int16) mono S16LE frame.
 func (p *Processor) Process(in []byte, out []byte) {
+	if p == nil || len(out) < OutputBytes {
+		return
+	}
 	var micSum [OutputSamples]int32
 	var refSum [OutputSamples]int32
 	micCount := 0
@@ -276,14 +327,20 @@ func (p *Processor) Process(in []byte, out []byte) {
 				}
 			}
 			e := d - y
-			mu := float32(0.08) / (norm + 1e-4)
-			idx = p.pos
-			for k := 0; k < len(p.w); k++ {
-				p.w[k] += mu * e * p.x[idx]
-				if idx == 0 {
-					idx = len(p.x) - 1
-				} else {
-					idx--
+			if math.IsNaN(float64(e)) || math.IsInf(float64(e), 0) {
+				p.w = [64]float32{}
+				p.x = [64]float32{}
+				e = d
+			} else {
+				mu := float32(0.08) / (norm + 1e-4)
+				idx = p.pos
+				for k := 0; k < len(p.w); k++ {
+					p.w[k] += mu * e * p.x[idx]
+					if idx == 0 {
+						idx = len(p.x) - 1
+					} else {
+						idx--
+					}
 				}
 			}
 			p.pos = (p.pos + 1) % len(p.x)
@@ -431,22 +488,25 @@ func runChained(in io.Reader, out io.Writer, desc Descriptor, origPath string, s
 
 // NewUnixDatagramSink returns a non-blocking sink function that sends 640-byte mono PCM
 // frames to a Unix domain datagram socket (e.g. /run/techo5-sound-ai.sock).
-// If the daemon is not listening or its socket buffer is full, frames are dropped silently
-// so the real-time ASP1 pipe is never delayed.
+//
+// It uses an unconnected unixgram socket with O_NONBLOCK so that:
+//  1. Restarting the daemon (which unlinks and recreates sockPath) never breaks a running
+//     external-asp process.
+//  2. If the daemon is not listening or its socket receive queue is full, frames are dropped
+//     immediately without ever delaying TECHO5's 80 ms real-time ASP1 exchange deadline.
 func NewUnixDatagramSink(sockPath string) (func([]byte), func()) {
-	conn, err := net.DialUnix("unixgram", nil, &net.UnixAddr{Name: sockPath, Net: "unixgram"})
+	uconn, err := net.ListenUnixgram("unixgram", &net.UnixAddr{Name: "", Net: "unixgram"})
 	if err != nil {
-		// Re-resolve per packet if the daemon starts after external-asp.
-		uconn, lerr := net.ListenUnixgram("unixgram", &net.UnixAddr{Name: "", Net: "unixgram"})
-		if lerr != nil {
-			return func([]byte) {}, func() {}
-		}
-		dst := &net.UnixAddr{Name: sockPath, Net: "unixgram"}
-		return func(frame []byte) {
-			_, _ = uconn.WriteToUnix(frame, dst)
-		}, func() { _ = uconn.Close() }
+		return func([]byte) {}, func() {}
 	}
+	if rc, err := uconn.SyscallConn(); err == nil {
+		_ = rc.Control(func(fd uintptr) {
+			_ = syscall.SetNonblock(int(fd), true)
+		})
+	}
+	dst := &net.UnixAddr{Name: sockPath, Net: "unixgram"}
 	return func(frame []byte) {
-		_, _ = conn.Write(frame)
-	}, func() { _ = conn.Close() }
+		_ = uconn.SetWriteDeadline(time.Now().Add(time.Millisecond))
+		_, _ = uconn.WriteToUnix(frame, dst)
+	}, func() { _ = uconn.Close() }
 }

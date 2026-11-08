@@ -196,9 +196,15 @@ func LoadEngine(path string) (eng *Engine, err error) {
 	if len(data) < 64 {
 		return nil, errors.New("sound: tflite model too short")
 	}
+	if string(data[4:8]) != "TFL3" {
+		return nil, errors.New("sound: invalid tflite header magic")
+	}
 
 	e := &Engine{raw: data, unmap: unmap}
 	root := int(rdU32(data, 0))
+	if root < 8 || root >= len(data)-4 {
+		return nil, errors.New("sound: invalid tflite root offset")
+	}
 	opcodesF := fbField(data, root, 1)
 	subgraphsF := fbField(data, root, 2)
 	buffersF := fbField(data, root, 4)
@@ -231,6 +237,10 @@ func LoadEngine(path string) (eng *Engine, err error) {
 
 	maxI8 := 0
 	e.tensors = make([]engTensor, fbVecLen(data, tensorsF))
+	if e.inputIdx < 0 || e.inputIdx >= len(e.tensors) || e.outIdx < 0 || e.outIdx >= len(e.tensors) {
+		return nil, errors.New("sound: subgraph input or output tensor index out of range")
+	}
+	const maxTensorElems = 1 << 24
 	for i := range e.tensors {
 		tt := fbIndirect(data, fbVecElem(data, tensorsF, i, 4))
 		sf := fbField(data, tt, 0)
@@ -245,8 +255,12 @@ func LoadEngine(path string) (eng *Engine, err error) {
 		t.shape = make([]int, fbVecLen(data, sf))
 		t.elems = 1
 		for d := range t.shape {
-			t.shape[d] = int(rdI32(data, fbVecElem(data, sf, d, 4)))
-			t.elems *= t.shape[d]
+			dim := int(rdI32(data, fbVecElem(data, sf, d, 4)))
+			if dim <= 0 || dim > maxTensorElems || maxTensorElems/dim < t.elems {
+				return nil, fmt.Errorf("sound: invalid tensor[%d] dimension %d", i, dim)
+			}
+			t.shape[d] = dim
+			t.elems *= dim
 		}
 
 		if bf != 0 {
@@ -319,6 +333,9 @@ func LoadEngine(path string) (eng *Engine, err error) {
 		if ocf != 0 {
 			ocIdx = int(rdU32(data, ocf))
 		}
+		if ocIdx < 0 || ocIdx >= len(opcodes) {
+			return nil, fmt.Errorf("sound: op[%d] opcode index %d out of range", i, ocIdx)
+		}
 		op := engOp{
 			code:      opcodes[ocIdx],
 			in:        make([]int, fbVecLen(data, inf)),
@@ -330,10 +347,21 @@ func LoadEngine(path string) (eng *Engine, err error) {
 			depthMul:  1,
 		}
 		for j := range op.in {
-			op.in[j] = int(rdI32(data, fbVecElem(data, inf, j, 4)))
+			idx := int(rdI32(data, fbVecElem(data, inf, j, 4)))
+			if idx >= len(e.tensors) || (j == 0 && idx < 0) {
+				return nil, fmt.Errorf("sound: op[%d] input[%d] tensor index %d out of range", i, j, idx)
+			}
+			op.in[j] = idx
 		}
 		for j := range op.out {
-			op.out[j] = int(rdI32(data, fbVecElem(data, outf, j, 4)))
+			idx := int(rdI32(data, fbVecElem(data, outf, j, 4)))
+			if idx < 0 || idx >= len(e.tensors) {
+				return nil, fmt.Errorf("sound: op[%d] output[%d] tensor index %d out of range", i, j, idx)
+			}
+			op.out[j] = idx
+		}
+		if len(op.in) == 0 || len(op.out) == 0 {
+			return nil, fmt.Errorf("sound: op[%d] has empty inputs or outputs", i)
 		}
 
 		if boptf != 0 {
@@ -531,10 +559,19 @@ func (e *Engine) rfft512Frame(in512, outCplx257 []float32) {
 }
 
 // Score runs YAMNet on 15,600 16 kHz PCM samples and returns the top-8 AudioSet classes.
-func (e *Engine) Score(pcm []int16) (EngineReply, error) {
+func (e *Engine) Score(pcm []int16) (rep EngineReply, err error) {
+	if e == nil || len(e.tensors) == 0 {
+		return EngineReply{}, errors.New("sound: engine is closed or nil")
+	}
 	if len(pcm) < windowSamples {
 		return EngineReply{}, errors.New("sound: short PCM window")
 	}
+	defer func() {
+		if r := recover(); r != nil {
+			rep = EngineReply{}
+			err = fmt.Errorf("sound: inference fault: %v", r)
+		}
+	}()
 	inF32 := e.tensors[e.inputIdx].f32
 	var sumSq float64
 	const scale = 1.0 / 32768.0
@@ -601,6 +638,9 @@ func (e *Engine) invoke() error {
 			begin := int(rdI32(e.tensors[op.in[1]].raw, 0))
 			end := int(rdI32(e.tensors[op.in[2]].raw, 0))
 			stride := int(rdI32(e.tensors[op.in[3]].raw, 0))
+			if stride <= 0 {
+				return errors.New("sound: non-positive strided_slice stride")
+			}
 			for i, o := begin, 0; i < end && o < tout.elems; i, o = i+stride, o+1 {
 				tout.f32[o] = t0.f32[i]
 			}

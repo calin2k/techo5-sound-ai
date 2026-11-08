@@ -15,16 +15,16 @@ type alertItemView struct {
 }
 
 type pageView struct {
-	Token         string
-	Msg           string
-	Err           string
-	Status        Status
-	Config        sound.Config
-	ModelSizeKB   int64
-	DefaultTopic  string
-	HasHAToken    bool
-	HasMQTTPass   bool
-	AlertChoices  []alertItemView
+	Token        string
+	Msg          string
+	Err          string
+	Status       Status
+	Config       sound.Config
+	ModelSizeKB  int64
+	DefaultTopic string
+	HasHAToken   bool
+	HasMQTTPass  bool
+	AlertChoices []alertItemView
 }
 
 func (d *Daemon) handleIndex(w http.ResponseWriter, r *http.Request) {
@@ -204,12 +204,13 @@ th { color: var(--muted); font-weight: 500; }
 
   {{if .Msg}}<div class="banner ok">{{.Msg}}</div>{{end}}
   {{if .Err}}<div class="banner err">{{.Err}}</div>{{end}}
+  <div id="notify-err" class="banner err" style="{{if not .Status.LastNotifyErr}}display:none{{end}}">{{.Status.LastNotifyErr}}</div>
 
   <div class="card">
     <h2>
       <span>Live Watch</span>
       <span id="audio-pill" class="badge {{if .Status.AudioConnected}}ok{{else}}warn{{end}}">
-        {{if .Status.AudioConnected}}Mic stream connected{{else}}Waiting for External ASP stream{{end}}
+        {{if .Status.AudioConnected}}Mic stream connected ({{.Status.FramesReceived}} frames){{else}}Waiting for External ASP stream{{end}}
       </span>
     </h2>
     <div class="grid2">
@@ -219,7 +220,7 @@ th { color: var(--muted); font-weight: 500; }
       </div>
       <div class="stat">
         <div class="k">Confidence / Level</div>
-        <div class="v" id="st-conf">{{if gt .Status.Confidence 0.0}}{{printf "%.0f%%" (mulf .Status.Confidence 100)}} ({{printf "%.1f" .Status.RMSDBFS}} dBFS){{else}}—{{end}}</div>
+        <div class="v" id="st-conf">{{if gt .Status.Confidence 0.0}}{{printf "%.0f%%" (mulf .Status.Confidence 100)}} ({{printf "%.1f" .Status.RMSDBFS}} dBFS){{else}}Floor {{printf "%.1f" .Status.FloorDBFS}} dBFS{{end}}</div>
       </div>
       <div class="stat">
         <div class="k">Last alert</div>
@@ -227,7 +228,7 @@ th { color: var(--muted); font-weight: 500; }
       </div>
       <div class="stat">
         <div class="k">Inference latency</div>
-        <div class="v" id="st-ms">{{if gt .Status.InferenceMS 0.0}}{{printf "%.1f ms / hop" .Status.InferenceMS}}{{else}}—{{end}}</div>
+        <div class="v" id="st-ms">{{if gt .Status.InferenceMS 0.0}}{{printf "%.1f ms / hop" .Status.InferenceMS}}{{else}}Idle (energy gate){{end}}</div>
       </div>
     </div>
     <div id="recent-wrap" style="margin-top:14px">
@@ -263,7 +264,7 @@ th { color: var(--muted); font-weight: 500; }
     <div class="btns">
       <form method="post" action="/setup/sound/model/download" style="margin:0">
         <input type="hidden" name="token" value="{{.Token}}">
-        <button type="submit" class="primary">{{if .Status.ModelReady}}Re-download YAMNet (3.7 MB){{else}}Download Google YAMNet (3.7 MB){{end}}</button>
+        <button type="submit" class="primary">{{if .Status.ModelReady}}Re-download YAMNet (4.0 MB){{else}}Download Google YAMNet (4.0 MB){{end}}</button>
       </form>
       <form method="post" action="/setup/sound/model/upload" enctype="multipart/form-data" style="display:flex;gap:8px;align-items:center;margin:0">
         <input type="hidden" name="token" value="{{.Token}}">
@@ -387,6 +388,11 @@ th { color: var(--muted); font-weight: 500; }
   </form>
 </div>
 <script>
+function esc(s) {
+  const d = document.createElement('div');
+  d.textContent = s || '';
+  return d.innerHTML;
+}
 setInterval(async () => {
   try {
     const r = await fetch('/api/status');
@@ -395,17 +401,42 @@ setInterval(async () => {
     document.getElementById('st-current').textContent = s.current || 'Quiet';
     document.getElementById('st-conf').textContent = s.confidence > 0
       ? Math.round(s.confidence * 100) + '% (' + s.rms_dbfs.toFixed(1) + ' dBFS)'
-      : '—';
+      : 'Floor ' + (s.floor_dbfs || -60).toFixed(1) + ' dBFS';
     document.getElementById('st-alert').textContent = s.last_alert
       ? s.last_alert + ' (' + s.last_alert_at + ')'
       : 'None';
     document.getElementById('st-ms').textContent = s.inference_ms > 0
       ? s.inference_ms.toFixed(1) + ' ms / hop'
-      : '—';
+      : 'Idle (energy gate)';
     const pill = document.getElementById('audio-pill');
     if (pill) {
       pill.textContent = s.audio_connected ? 'Mic stream connected (' + s.frames_received + ' frames)' : 'Waiting for External ASP stream';
       pill.className = 'badge ' + (s.audio_connected ? 'ok' : 'warn');
+    }
+    const badge = document.getElementById('run-badge');
+    if (badge) {
+      badge.textContent = s.running ? 'Active' : (!s.model_ready ? 'Model needed' : 'Paused');
+      badge.className = 'badge ' + (s.running ? 'ok' : 'warn');
+    }
+    const nerr = document.getElementById('notify-err');
+    if (nerr) {
+      if (s.last_notify_err) {
+        nerr.textContent = s.last_notify_err;
+        nerr.style.display = 'block';
+      } else {
+        nerr.style.display = 'none';
+      }
+    }
+    const wrap = document.getElementById('recent-wrap');
+    if (wrap && Array.isArray(s.recent) && s.recent.length > 0) {
+      let rows = '';
+      for (const ev of s.recent) {
+        const tag = ev.alert ? ' <span class="badge ok">Alert</span>' : '';
+        rows += '<tr><td>' + esc(ev.time) + '</td><td>' + esc(ev.label) + tag + '</td><td>' +
+          esc(ev.raw_class) + '</td><td>' + Math.round((ev.confidence || 0) * 100) + '%</td><td>' +
+          (ev.rms_dbfs || 0).toFixed(1) + ' dBFS</td></tr>';
+      }
+      wrap.innerHTML = '<table><thead><tr><th>Time</th><th>Sound</th><th>AudioSet class</th><th>Confidence</th><th>Level</th></tr></thead><tbody>' + rows + '</tbody></table>';
     }
   } catch (e) {}
 }, 2000);
@@ -413,7 +444,3 @@ setInterval(async () => {
 </body>
 </html>
 `))
-
-func init() {
-	// Register helper before parsing if needed; re-parse with FuncMap.
-}

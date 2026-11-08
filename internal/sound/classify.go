@@ -1,6 +1,9 @@
 package sound
 
-import "strings"
+import (
+	"math"
+	"strings"
+)
 
 // TopClass is one scored AudioSet class from yamnet-tflite.
 type TopClass struct {
@@ -161,8 +164,10 @@ func ClassifyWithMin(top []TopClass, minConf float64) Detection {
 	if len(top) == 0 {
 		return Detection{Category: "quiet", Label: "Quiet"}
 	}
-	if minConf <= 0 {
+	if math.IsNaN(minConf) || math.IsInf(minConf, 0) || minConf <= 0 {
 		minConf = 0.25
+	} else if minConf > 0.99 {
+		minConf = 0.99
 	}
 	scale := minConf / 0.25
 
@@ -173,13 +178,20 @@ func ClassifyWithMin(top []TopClass, minConf float64) Detection {
 		var sum, topScore float64
 		var raw string
 		for _, tc := range top {
+			if math.IsNaN(tc.Score) || math.IsInf(tc.Score, 0) || tc.Score <= 0 {
+				continue
+			}
+			sc := tc.Score
+			if sc > 1.0 {
+				sc = 1.0
+			}
 			match := r.ids[tc.ID] || (r.category == "music" && isMusicID(tc.ID))
 			if !match {
 				continue
 			}
-			sum += tc.Score
-			if tc.Score > topScore {
-				topScore = tc.Score
+			sum += sc
+			if sc > topScore {
+				topScore = sc
 				raw = tc.Name
 			}
 		}
@@ -224,17 +236,33 @@ func ClassifyWithMin(top []TopClass, minConf float64) Detection {
 	if minConf > 0.35 && fallbackMin < minConf {
 		fallbackMin = minConf
 	}
-	t0 := top[0]
-	if !isNoiseFloorID(t0.ID) && t0.Score >= fallbackMin {
-		cat := strings.ToLower(t0.Name)
-		cat = strings.NewReplacer(", ", "_", " ", "_", "(", "", ")", "", "/", "_").Replace(cat)
-		return Detection{
-			Category:   cat,
-			Label:      t0.Name,
-			RawClass:   t0.Name,
-			Confidence: t0.Score,
-			Actionable: false,
+	for _, t0 := range top {
+		if math.IsNaN(t0.Score) || math.IsInf(t0.Score, 0) || t0.Score <= 0 {
+			continue
 		}
+		if isNoiseFloorID(t0.ID) {
+			break
+		}
+		sc := t0.Score
+		if sc > 1.0 {
+			sc = 1.0
+		}
+		if sc >= fallbackMin {
+			name := strings.TrimSpace(t0.Name)
+			if name == "" {
+				name = "Unknown"
+			}
+			cat := strings.ToLower(name)
+			cat = strings.NewReplacer(", ", "_", " ", "_", "(", "", ")", "", "/", "_").Replace(cat)
+			return Detection{
+				Category:   cat,
+				Label:      name,
+				RawClass:   name,
+				Confidence: sc,
+				Actionable: false,
+			}
+		}
+		break
 	}
 
 	return Detection{Category: "quiet", Label: "Quiet"}

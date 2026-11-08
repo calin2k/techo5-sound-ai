@@ -152,39 +152,46 @@ func SendHANotification(client *http.Client, sc Config, devName string, det Dete
 
 	var firstErr error
 	if webhookURL != "" {
-		payload, _ := json.Marshal(map[string]any{
-			"title":        title,
-			"message":      msg,
-			"category":     det.Category,
-			"sound":        det.Label,
-			"raw_class":    det.RawClass,
-			"confidence":   float64(int(det.Confidence*1000+0.5)) / 1000,
-			"rms_dbfs":     float64(int(rep.RMSDBFS*10)) / 10,
-			"inference_ms": float64(int(rep.MS*10)) / 10,
-			"device":       devName,
-			"timestamp":    time.Now().UTC().Format(time.RFC3339),
-		})
-		req, err := http.NewRequest(http.MethodPost, webhookURL, bytes.NewReader(payload))
-		if err != nil {
-			firstErr = err
+		if !hasHTTPScheme(webhookURL) {
+			firstErr = errors.New("webhook URL must start with http:// or https://")
 		} else {
-			req.Header.Set("Content-Type", "application/json")
-			resp, err := client.Do(req)
+			payload, _ := json.Marshal(map[string]any{
+				"title":        title,
+				"message":      msg,
+				"category":     det.Category,
+				"sound":        det.Label,
+				"raw_class":    det.RawClass,
+				"confidence":   float64(int(det.Confidence*1000+0.5)) / 1000,
+				"rms_dbfs":     float64(int(rep.RMSDBFS*10)) / 10,
+				"inference_ms": float64(int(rep.MS*10)) / 10,
+				"device":       devName,
+				"timestamp":    time.Now().UTC().Format(time.RFC3339),
+			})
+			req, err := http.NewRequest(http.MethodPost, webhookURL, bytes.NewReader(payload))
 			if err != nil {
 				firstErr = err
 			} else {
-				_, _ = io.Copy(io.Discard, resp.Body)
-				resp.Body.Close()
-				if resp.StatusCode >= 300 {
-					firstErr = fmt.Errorf("webhook returned HTTP %d", resp.StatusCode)
+				req.Header.Set("Content-Type", "application/json")
+				resp, err := client.Do(req)
+				if err != nil {
+					firstErr = err
+				} else {
+					_, _ = io.CopyN(io.Discard, resp.Body, 64<<10)
+					resp.Body.Close()
+					if resp.StatusCode >= 300 {
+						firstErr = fmt.Errorf("webhook returned HTTP %d", resp.StatusCode)
+					}
 				}
 			}
 		}
 	}
 
 	if haURL != "" && service != "" {
+		if !hasHTTPScheme(haURL) {
+			return errors.New("Home Assistant URL must start with http:// or https://")
+		}
 		parts := strings.SplitN(service, ".", 2)
-		if len(parts) != 2 || parts[0] == "" || parts[1] == "" {
+		if len(parts) != 2 || !isValidHASlug(parts[0]) || !isValidHASlug(parts[1]) {
 			return errors.New("service must be domain.action, such as notify.notify or persistent_notification.create")
 		}
 		data := map[string]string{
@@ -208,7 +215,7 @@ func SendHANotification(client *http.Client, sc Config, devName string, det Dete
 		if err != nil {
 			return err
 		}
-		_, _ = io.Copy(io.Discard, resp.Body)
+		_, _ = io.CopyN(io.Discard, resp.Body, 64<<10)
 		resp.Body.Close()
 		if resp.StatusCode >= 300 {
 			return fmt.Errorf("Home Assistant service returned HTTP %d", resp.StatusCode)
@@ -216,6 +223,23 @@ func SendHANotification(client *http.Client, sc Config, devName string, det Dete
 	}
 
 	return firstErr
+}
+
+func hasHTTPScheme(u string) bool {
+	return strings.HasPrefix(u, "http://") || strings.HasPrefix(u, "https://")
+}
+
+func isValidHASlug(s string) bool {
+	if s == "" {
+		return false
+	}
+	for i := 0; i < len(s); i++ {
+		c := s[i]
+		if !((c >= 'a' && c <= 'z') || (c >= 'A' && c <= 'Z') || (c >= '0' && c <= '9') || c == '_') {
+			return false
+		}
+	}
+	return true
 }
 
 // mqttMsg is one publish item in a single short-lived MQTT 3.1.1 session.
@@ -314,6 +338,17 @@ func PublishMQTT(dial func(network, addr string, timeout time.Duration) (net.Con
 func mqttSend(dial func(string, string, time.Duration) (net.Conn, error),
 	addr, clientID, user, pass string, msgs []mqttMsg) error {
 
+	for _, s := range []string{clientID, user, pass} {
+		if len(s) > 0xffff {
+			return errors.New("mqtt: credential or client ID exceeds 65535 bytes")
+		}
+	}
+	for _, m := range msgs {
+		if m.topic == "" || len(m.topic) > 0xffff || strings.IndexByte(m.topic, 0) >= 0 {
+			return errors.New("mqtt: invalid topic length or NUL byte")
+		}
+	}
+
 	conn, err := dial("tcp", addr, 4*time.Second)
 	if err != nil {
 		return err
@@ -349,8 +384,8 @@ func mqttSend(dial func(string, string, time.Duration) (net.Conn, error),
 	if _, err := io.ReadFull(conn, ack[:]); err != nil {
 		return fmt.Errorf("mqtt connack: %w", err)
 	}
-	if ack[0] != 0x20 || ack[3] != 0x00 {
-		return fmt.Errorf("mqtt broker refused connection (code %d)", ack[3])
+	if ack[0] != 0x20 || ack[1] != 0x02 || ack[3] != 0x00 {
+		return fmt.Errorf("mqtt broker refused connection (hdr=%#x code=%d)", ack[0], ack[3])
 	}
 
 	for _, m := range msgs {
@@ -378,6 +413,9 @@ func writeMQTTString(b *bytes.Buffer, s string) {
 }
 
 func writeMQTTPacket(w io.Writer, hdr byte, body []byte) error {
+	if len(body) > 268435455 {
+		return errors.New("mqtt: packet payload exceeds maximum remaining length")
+	}
 	var pkt bytes.Buffer
 	pkt.WriteByte(hdr)
 	rem := len(body)

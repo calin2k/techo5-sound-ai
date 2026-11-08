@@ -7,7 +7,7 @@
 set -eu
 
 REPO_RELEASE_URL="https://github.com/calin2k/techo5-sound-ai/releases/latest/download/techo5-sound-ai-linux-arm"
-YAMNET_URL="https://www.kaggle.com/api/v1/models/google/yamnet/tfLite/classification-tflite/1/download"
+YAMNET_URL="https://storage.googleapis.com/mediapipe-models/audio_classifier/yamnet/float32/1/yamnet.tflite"
 
 install_on_device() {
 	mkdir -p /data/techo5-sound-ai /data/misc/techo5/yamnet
