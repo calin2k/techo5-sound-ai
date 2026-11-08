@@ -76,8 +76,8 @@ fi
 
 # Running directly on the TECHO5 device
 mkdir -p /data/techo5-sound-ai
-if [ ! -f /data/techo5-sound-ai/techo5-sound-ai ]; then
-	echo "Downloading techo5-sound-ai binary..."
-	wget -O /data/techo5-sound-ai/techo5-sound-ai "$REPO_RELEASE_URL"
-fi
+echo "Downloading latest techo5-sound-ai binary..."
+wget -O /data/techo5-sound-ai/techo5-sound-ai.new "$REPO_RELEASE_URL"
+chmod 700 /data/techo5-sound-ai/techo5-sound-ai.new
+mv -f /data/techo5-sound-ai/techo5-sound-ai.new /data/techo5-sound-ai/techo5-sound-ai
 install_on_device
