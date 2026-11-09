@@ -483,5 +483,27 @@ func TestProcessorPlaybackActiveTagging(t *testing.T) {
 	if len(sinkFrames[1]) != OutputBytes+2 || sinkFrames[1][OutputBytes] != 1 {
 		t.Fatalf("active ref frame len = %d, tag = %d, want len=%d tag=1", len(sinkFrames[1]), sinkFrames[1][OutputBytes], OutputBytes+2)
 	}
+
+	// 3. Verify 25-frame (500 ms) playbackHold keeps PlaybackActive() true across post-playback echo tail
+	desc, err := ReadDescriptor(bytes.NewReader(descBytes))
+	if err != nil {
+		t.Fatal(err)
+	}
+	proc := NewProcessor(desc)
+	outPkt := make([]byte, OutputBytes)
+	proc.Process(activeFrame, outPkt)
+	if !proc.PlaybackActive() {
+		t.Fatal("expected PlaybackActive() == true on active ref frame")
+	}
+	for i := 0; i < 25; i++ {
+		proc.Process(silentFrame, outPkt)
+		if !proc.PlaybackActive() {
+			t.Fatalf("expected PlaybackActive() to hold true during tail frame %d", i)
+		}
+	}
+	proc.Process(silentFrame, outPkt)
+	if proc.PlaybackActive() {
+		t.Fatal("expected PlaybackActive() == false after 25-frame hold expires")
+	}
 }
 

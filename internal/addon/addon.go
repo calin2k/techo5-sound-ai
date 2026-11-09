@@ -28,15 +28,17 @@ import (
 )
 
 const (
-	Version       = "v1.4.0"
+	Version       = "v1.4.1"
 	WindowSamples = 15600 // 975 ms at 16 kHz
 	HopSamples    = 7680  // 480 ms hop (~50% overlap)
 
 	// Energy gate thresholds: skip full 28-layer MobileNetV1 inference when the room sits
-	// quietly on its noise floor, reducing idle CPU usage from ~75% of one core to <0.2%.
-	minActiveDBFS = -68.0
-	alwaysRunDBFS = -52.0
-	aboveFloorDB  = 4.5
+	// quietly on its noise floor, reducing idle CPU usage from ~75% of one core to <0.2%
+	// and preventing quiet room noise from triggering false classifications.
+	minActiveDBFS = -55.0
+	alwaysRunDBFS = -42.0
+	aboveFloorDB  = 5.5
+	minWindowDBFS = -46.0
 
 	DefaultModelPath  = "/data/misc/techo5/yamnet/yamnet.tflite"
 	LegacyModelPath   = "/data/sound-ai/yamnet.tflite"
@@ -324,7 +326,7 @@ func (d *Daemon) SetSpeakerPlaying(active bool) {
 
 func (d *Daemon) isSpeakerPlaying() bool {
 	ns := d.lastPlaybackNs.Load()
-	return ns > 0 && time.Since(time.Unix(0, ns)) < 2*time.Second
+	return ns > 0 && time.Since(time.Unix(0, ns)) < 3*time.Second
 }
 
 // FeedFrame pushes a 16 kHz mono int16 PCM frame into the classifier ring buffer.
@@ -503,9 +505,11 @@ func isImmediateSingleHop(cat string, conf, minConf float64) bool {
 	switch cat {
 	case "smoke_alarm", "glass", "siren", "doorbell":
 		return true
-	case "knock", "finger_snap", "clapping", "sneeze":
+	case "knock", "finger_snap":
 		// Impulsive transient sounds typically last 100-250 ms (a single 480 ms hop).
 		return conf >= minConf+0.05
+	case "clapping", "sneeze":
+		return conf >= minConf+0.25
 	}
 	return false
 }
@@ -524,15 +528,20 @@ func (d *Daemon) handleReplyWithPCM(rep sound.EngineReply, pcm []int16) {
 		cooldown = 15 * time.Second
 	}
 
-	det := sound.ClassifyWithConfig(rep.Top, sc)
-	if cdet, ok := sound.MatchCustomSound(rep.Embedding, sc.CustomSounds); ok {
-		if det.Category == "quiet" || !det.Actionable || cdet.Confidence >= det.Confidence-0.05 {
-			det = cdet
+	var det sound.Detection
+	if rep.RMSDBFS != 0 && rep.RMSDBFS < minWindowDBFS {
+		det = sound.Detection{Category: "quiet", Label: "Quiet"}
+	} else {
+		det = sound.ClassifyWithConfig(rep.Top, sc)
+		if cdet, ok := sound.MatchCustomSound(rep.Embedding, sc.CustomSounds); ok {
+			if det.Category == "quiet" || !det.Actionable || cdet.Confidence >= det.Confidence-0.05 {
+				det = cdet
+			}
 		}
 	}
 
 	d.mu.Lock()
-	if len(rep.Embedding) > 0 && rep.RMSDBFS >= -55.0 {
+	if len(rep.Embedding) > 0 && rep.RMSDBFS >= minWindowDBFS {
 		if cap(d.lastEmbed) < len(rep.Embedding) {
 			d.lastEmbed = make([]byte, len(rep.Embedding))
 		} else {
@@ -583,6 +592,12 @@ func (d *Daemon) handleReplyWithPCM(rep sound.EngineReply, pcm []int16) {
 	}
 
 	if !strings.HasPrefix(det.Category, "custom_") && !isImmediateSingleHop(det.Category, det.Confidence, minConf) && det.Confidence < 0.45 && d.streak < 2 {
+		d.rmsDBFS = math.Round(rep.RMSDBFS*10) / 10
+		d.inferenceMS = math.Round(rep.MS*10) / 10
+		d.mu.Unlock()
+		return
+	}
+	if !det.Actionable && !strings.HasPrefix(det.Category, "custom_") && d.streak < 2 && (det.Confidence < 0.75 || (rep.RMSDBFS != 0 && rep.RMSDBFS < -35.0)) {
 		d.rmsDBFS = math.Round(rep.RMSDBFS*10) / 10
 		d.inferenceMS = math.Round(rep.MS*10) / 10
 		d.mu.Unlock()

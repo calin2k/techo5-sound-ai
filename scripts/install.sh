@@ -46,9 +46,11 @@ EOF
 	fi
 	chmod 755 "$RCLOCAL"
 
-	# Enable External ASP in TECHO5 state.json if not already enabled
-	if [ -f /data/misc/techo5/state.json ] && grep -q '"asp": "builtin"' /data/misc/techo5/state.json 2>/dev/null; then
-		sed -i 's/"asp": "builtin"/"asp": "external"/' /data/misc/techo5/state.json
+	# Enable External ASP in TECHO5 state.json and restart TECHO5 so it spawns the updated external-asp helper
+	if [ -f /data/misc/techo5/state.json ]; then
+		if grep -q '"asp": "builtin"' /data/misc/techo5/state.json 2>/dev/null; then
+			sed -i 's/"asp": "builtin"/"asp": "external"/' /data/misc/techo5/state.json
+		fi
 		kill $(pidof techo5) 2>/dev/null || true
 	fi
 

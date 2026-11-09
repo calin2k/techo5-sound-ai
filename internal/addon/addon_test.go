@@ -225,6 +225,19 @@ func TestHysteresisStreakAndQuietRecovery(t *testing.T) {
 	if st := d.Status(); st.Current != "Glass breaking" {
 		t.Fatalf("expected urgent glass breaking to trigger on 1st hop, got %q", st.Current)
 	}
+
+	// 5. Sub-threshold window RMS (< minWindowDBFS = -46.0 dBFS) is forced to Quiet
+	// even if YAMNet reports high confidence on background noise (e.g. Typing at -64.3 dBFS).
+	for i := 0; i < 3; i++ {
+		d.handleReply(sound.EngineReply{
+			MS:      25.0,
+			RMSDBFS: -53.1,
+			Top:     []sound.TopClass{{ID: 378, Name: "Typing", Score: 0.97}},
+		})
+	}
+	if st := d.Status(); st.Current != "Quiet" {
+		t.Fatalf("expected sub-threshold window (-53.1 dBFS) to force Quiet, got %q", st.Current)
+	}
 }
 
 func TestCorruptConfigAndOutOfRangeClamping(t *testing.T) {

@@ -411,8 +411,8 @@ func TestClassifyAllRuleCategoriesAndEdgeCases(t *testing.T) {
 		t.Fatalf("empty fallback name = %+v", fbEmpty)
 	}
 
-	// All noise-floor IDs map to quiet
-	for _, nfID := range []int{494, 500, 501, 502, 506, 507, 513, 514, 515} {
+	// All noise-floor IDs (including ambiguous Hands/Breathing/Animal/Cap gun) map to quiet
+	for _, nfID := range []int{56, 66, 67, 426, 494, 500, 501, 502, 506, 507, 513, 514, 515} {
 		if got := Classify([]TopClass{{ID: nfID, Name: "NoiseFloor", Score: 0.95}}); got.Category != "quiet" {
 			t.Fatalf("noise floor ID %d mapped to %+v, want quiet", nfID, got)
 		}

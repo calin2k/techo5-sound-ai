@@ -94,8 +94,8 @@ var rules = []rule{
 		ids: idSet(57),
 	},
 	{
-		category: "clapping", label: "Clapping", minScore: 0.22, actionable: true,
-		ids: idSet(56, 58, 62),
+		category: "clapping", label: "Clapping", minScore: 0.24, actionable: true,
+		ids: idSet(58, 62),
 	},
 	{
 		category: "knock", label: "Knock", minScore: 0.22, actionable: true,
@@ -130,11 +130,11 @@ var rules = []rule{
 		ids: idSet(371),
 	},
 	{
-		category: "typing", label: "Typing", minScore: 0.26, actionable: false,
+		category: "typing", label: "Typing", minScore: 0.38, actionable: false,
 		ids: idSet(378, 380),
 	},
 	{
-		category: "snoring", label: "Snoring", minScore: 0.26, actionable: false,
+		category: "snoring", label: "Snoring", minScore: 0.38, actionable: false,
 		ids: idSet(38),
 	},
 	{
@@ -156,9 +156,10 @@ func isMusicID(id int) bool {
 }
 
 func isNoiseFloorID(id int) bool {
-	// Silence, Inside small/large room, Pink/White noise, Static, Hum
+	// Silence, Inside small/large room, Pink/White noise, Static, Hum, plus ambiguous noise-floor
+	// classes (Hands rustle, Breathing, generic Animal, Cap gun click).
 	switch id {
-	case 494, 500, 501, 502, 506, 507, 513, 514, 515:
+	case 56, 66, 67, 426, 494, 500, 501, 502, 506, 507, 513, 514, 515:
 		return true
 	}
 	return false
@@ -259,8 +260,8 @@ func classifyInternal(top []TopClass, minConf float64, catMin map[string]float64
 	}
 
 	// Fallback: surface any other distinct AudioSet class (e.g., Microwave oven, Thunder, Guitar).
-	fallbackMin := 0.35 * baseScale
-	if minConf > 0.35 && fallbackMin < minConf {
+	fallbackMin := 0.50 * baseScale
+	if minConf > 0.50 && fallbackMin < minConf {
 		fallbackMin = minConf
 	}
 	for _, t0 := range top {

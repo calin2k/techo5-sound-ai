@@ -237,6 +237,7 @@ type Processor struct {
 	x              [64]float32
 	pos            int
 	playbackActive bool
+	playbackHold   int
 }
 
 // PlaybackActive reports whether the speaker loopback reference channels (RoleREF)
@@ -322,8 +323,17 @@ func (p *Processor) Process(in []byte, out []byte) {
 			refEnergy += int64(r) * int64(r)
 		}
 	}
-	// Speaker loopback RMS > 180 (~ -45 dBFS) indicates active media playback on the device speaker.
-	p.playbackActive = refCount > 0 && refEnergy > int64(OutputSamples)*32400
+	// Speaker loopback RMS > 50 (~ -56 dBFS) indicates active media/chime playback on the device speaker;
+	// hold for 25 frames (500 ms) so room reverberation tails after chimes or TTS pauses remain guarded.
+	if refCount > 0 && refEnergy > int64(OutputSamples)*2500 {
+		p.playbackHold = 25
+		p.playbackActive = true
+	} else if p.playbackHold > 0 {
+		p.playbackHold--
+		p.playbackActive = true
+	} else {
+		p.playbackActive = false
+	}
 
 	for i := 0; i < OutputSamples; i++ {
 		m := micSum[i] / int32(micCount)
@@ -383,13 +393,15 @@ func (p *Processor) Process(in []byte, out []byte) {
 			stepFloor = 0.095
 		}
 		p.floor = max(p.floor+(rms-p.floor)*stepFloor, 16.0)
-		if rms > p.floor*3.98 {
+		if rms > p.floor*3.98 && rms >= 120.0 {
 			want := min(max(2319.0/rms, 1.0), 22.38)
 			stepGain := float32(0.004)
 			if want < p.gain {
 				stepGain = 0.039
 			}
 			p.gain += (want - p.gain) * stepGain
+		} else {
+			p.gain += (10.0 - p.gain) * 0.005
 		}
 		if peak > 0 {
 			p.gain = min(p.gain, 23197.0/peak)
