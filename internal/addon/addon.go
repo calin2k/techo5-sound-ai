@@ -28,7 +28,7 @@ import (
 )
 
 const (
-	Version       = "v1.3.0"
+	Version       = "v1.4.0"
 	WindowSamples = 15600 // 975 ms at 16 kHz
 	HopSamples    = 7680  // 480 ms hop (~50% overlap)
 
@@ -72,6 +72,9 @@ type Status struct {
 	LastAlert      string   `json:"last_alert"`
 	LastAlertAt    string   `json:"last_alert_at"`
 	HasAlertAudio  bool     `json:"has_alert_audio"`
+	SpeakerPlaying bool     `json:"speaker_playing"`
+	HasEmbedding   bool     `json:"has_embedding"`
+	CustomCount    int      `json:"custom_count"`
 	LastNotifyErr  string   `json:"last_notify_err"`
 	Recent         []Event  `json:"recent"`
 	AlertChoices   []string `json:"-"`
@@ -108,6 +111,7 @@ type Daemon struct {
 	lastAlert     string
 	lastAlertAt   time.Time
 	lastAlertPCM  []int16
+	lastEmbed     []byte
 	lastAlertTime map[string]time.Time
 	lastNotifyErr string
 	recent        []Event
@@ -118,9 +122,10 @@ type Daemon struct {
 	streak        int
 	quietHops     int
 
-	framesRx    atomic.Uint64
-	lastFrameNs atomic.Int64
-	pcmCh       chan []int16
+	framesRx       atomic.Uint64
+	lastFrameNs    atomic.Int64
+	lastPlaybackNs atomic.Int64
+	pcmCh          chan []int16
 	notifyCh    chan notifyJob
 	httpClient  *http.Client
 	mqttDial    func(network, addr string, timeout time.Duration) (net.Conn, error)
@@ -308,6 +313,20 @@ func (d *Daemon) scoreWindow(win []int16) (sound.EngineReply, bool, error) {
 	return rep, true, err
 }
 
+// SetSpeakerPlaying marks speaker loopback playback active (for Self-Playback Guard).
+func (d *Daemon) SetSpeakerPlaying(active bool) {
+	if active {
+		d.lastPlaybackNs.Store(time.Now().UnixNano())
+	} else {
+		d.lastPlaybackNs.Store(0)
+	}
+}
+
+func (d *Daemon) isSpeakerPlaying() bool {
+	ns := d.lastPlaybackNs.Load()
+	return ns > 0 && time.Since(time.Unix(0, ns)) < 2*time.Second
+}
+
 // FeedFrame pushes a 16 kHz mono int16 PCM frame into the classifier ring buffer.
 func (d *Daemon) FeedFrame(samples []int16) {
 	d.framesRx.Add(1)
@@ -366,7 +385,14 @@ func (d *Daemon) Run(ctx context.Context) error {
 				if n < 2 {
 					continue
 				}
-				samples := make([]int16, n/2)
+				pcmBytes := n
+				if n == 642 {
+					if buf[640] == 1 {
+						d.lastPlaybackNs.Store(time.Now().UnixNano())
+					}
+					pcmBytes = 640
+				}
+				samples := make([]int16, pcmBytes/2)
 				for i := range samples {
 					samples[i] = int16(binary.LittleEndian.Uint16(buf[i*2:]))
 				}
@@ -499,8 +525,22 @@ func (d *Daemon) handleReplyWithPCM(rep sound.EngineReply, pcm []int16) {
 	}
 
 	det := sound.ClassifyWithConfig(rep.Top, sc)
+	if cdet, ok := sound.MatchCustomSound(rep.Embedding, sc.CustomSounds); ok {
+		if det.Category == "quiet" || !det.Actionable || cdet.Confidence >= det.Confidence-0.05 {
+			det = cdet
+		}
+	}
 
 	d.mu.Lock()
+	if len(rep.Embedding) > 0 && rep.RMSDBFS >= -55.0 {
+		if cap(d.lastEmbed) < len(rep.Embedding) {
+			d.lastEmbed = make([]byte, len(rep.Embedding))
+		} else {
+			d.lastEmbed = d.lastEmbed[:len(rep.Embedding)]
+		}
+		copy(d.lastEmbed, rep.Embedding)
+	}
+
 	if det.Category == "quiet" {
 		if rep.RMSDBFS != 0 {
 			d.floorDBFS = math.Round((0.96*d.floorDBFS+0.04*rep.RMSDBFS)*10) / 10
@@ -528,7 +568,21 @@ func (d *Daemon) handleReplyWithPCM(rep sound.EngineReply, pcm []int16) {
 		d.streak = 1
 	}
 
-	if !isImmediateSingleHop(det.Category, det.Confidence, minConf) && det.Confidence < 0.45 && d.streak < 2 {
+	isLifeSafety := det.Category == "smoke_alarm" || det.Category == "glass" || det.Category == "siren"
+	if sc.PlaybackGuard && d.isSpeakerPlaying() && !isLifeSafety && !strings.HasPrefix(det.Category, "custom_") {
+		guardMin := minConf + 0.20
+		if guardMin < 0.55 {
+			guardMin = 0.55
+		}
+		if det.Confidence < guardMin {
+			d.rmsDBFS = math.Round(rep.RMSDBFS*10) / 10
+			d.inferenceMS = math.Round(rep.MS*10) / 10
+			d.mu.Unlock()
+			return
+		}
+	}
+
+	if !strings.HasPrefix(det.Category, "custom_") && !isImmediateSingleHop(det.Category, det.Confidence, minConf) && det.Confidence < 0.45 && d.streak < 2 {
 		d.rmsDBFS = math.Round(rep.RMSDBFS*10) / 10
 		d.inferenceMS = math.Round(rep.MS*10) / 10
 		d.mu.Unlock()
@@ -679,6 +733,9 @@ func (d *Daemon) Status() Status {
 		LastAlert:      d.lastAlert,
 		LastAlertAt:    alertAt,
 		HasAlertAudio:  len(d.lastAlertPCM) > 0,
+		SpeakerPlaying: d.isSpeakerPlaying(),
+		HasEmbedding:   len(d.lastEmbed) > 0,
+		CustomCount:    len(d.cfg.CustomSounds),
 		LastNotifyErr:  d.lastNotifyErr,
 		Recent:         recent,
 	}
@@ -692,6 +749,8 @@ func (d *Daemon) Handler() http.Handler {
 	mux.HandleFunc("GET /api/last-alert.wav", d.handleLastAlertWAV)
 	mux.HandleFunc("POST /setup/sound", d.handleSaveConfig)
 	mux.HandleFunc("POST /setup/sound/test", d.handleTestNotify)
+	mux.HandleFunc("POST /setup/sound/custom/learn", d.handleCustomLearn)
+	mux.HandleFunc("POST /setup/sound/custom/delete", d.handleCustomDelete)
 	mux.HandleFunc("POST /setup/sound/model/download", d.handleModelDownload)
 	mux.HandleFunc("POST /setup/sound/model/upload", d.handleModelUpload)
 	mux.HandleFunc("POST /setup/sound/model/remove", d.handleModelRemove)
@@ -764,6 +823,8 @@ func (d *Daemon) handleSaveConfig(w http.ResponseWriter, r *http.Request) {
 		MinConfidence: cur.MinConfidence,
 		CooldownSec:   cur.CooldownSec,
 		Alerts:        r.Form["alerts"],
+		PlaybackGuard: r.FormValue("playback_guard") == "1",
+		CustomSounds:  cur.CustomSounds,
 		HAWebhookURL:  strings.TrimSpace(r.FormValue("ha_webhook_url")),
 		HAURL:         strings.TrimSpace(r.FormValue("ha_url")),
 		HAToken:       strings.TrimSpace(r.FormValue("ha_token")),
@@ -821,6 +882,55 @@ func (d *Daemon) handleSaveConfig(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	d.redirectMsg(w, r, "msg", "Saved")
+}
+
+func (d *Daemon) handleCustomLearn(w http.ResponseWriter, r *http.Request) {
+	if !d.checkToken(w, r) {
+		http.Error(w, "invalid token", http.StatusForbidden)
+		return
+	}
+	name := strings.TrimSpace(r.FormValue("name"))
+	th := 0.80
+	if v, err := strconv.ParseFloat(strings.TrimSpace(r.FormValue("threshold")), 64); err == nil && v >= 0.50 && v <= 0.98 {
+		th = v
+	}
+	d.mu.RLock()
+	emb := append([]byte(nil), d.lastEmbed...)
+	cur := d.cfg
+	d.mu.RUnlock()
+
+	updated, cs, err := sound.LearnCustomSound(cur.CustomSounds, name, th, emb)
+	if err != nil {
+		d.redirectMsg(w, r, "err", err.Error())
+		return
+	}
+	cur.CustomSounds = updated
+	if err := d.saveConfig(cur); err != nil {
+		d.redirectMsg(w, r, "err", err.Error())
+		return
+	}
+	d.redirectMsg(w, r, "msg", fmt.Sprintf("Learned custom sound %q (%d sample(s))", cs.Name, cs.Samples))
+}
+
+func (d *Daemon) handleCustomDelete(w http.ResponseWriter, r *http.Request) {
+	if !d.checkToken(w, r) {
+		http.Error(w, "invalid token", http.StatusForbidden)
+		return
+	}
+	cat := strings.TrimSpace(r.FormValue("category"))
+	cur := d.Config()
+	filtered := make([]sound.CustomSound, 0, len(cur.CustomSounds))
+	for _, cs := range cur.CustomSounds {
+		if cs.Category != cat && cs.Name != cat {
+			filtered = append(filtered, cs)
+		}
+	}
+	cur.CustomSounds = filtered
+	if err := d.saveConfig(cur); err != nil {
+		d.redirectMsg(w, r, "err", err.Error())
+		return
+	}
+	d.redirectMsg(w, r, "msg", "Removed custom sound")
 }
 
 func (d *Daemon) handleTestNotify(w http.ResponseWriter, r *http.Request) {

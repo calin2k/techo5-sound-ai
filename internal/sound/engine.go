@@ -94,6 +94,10 @@ type Engine struct {
 	tw512Im   [256]float32
 	fftZr     [256]float32
 	fftZi     [256]float32
+
+	// 1024-D L2-normalized int8 embedding captured at the YAMNet global pooling layer (opMean)
+	lastEmbed [1024]byte
+	hasEmbed  bool
 }
 
 func rdU16(b []byte, p int) uint16 { return binary.LittleEndian.Uint16(b[p:]) }
@@ -612,10 +616,15 @@ func (e *Engine) Score(pcm []int16) (rep EngineReply, err error) {
 		top[pos] = TopClass{ID: id, Name: audioSetClasses[id], Score: s}
 	}
 
+	var emb []byte
+	if e.hasEmbed {
+		emb = e.lastEmbed[:]
+	}
 	return EngineReply{
-		MS:      ms,
-		RMSDBFS: dbfs,
-		Top:     top[:],
+		MS:        ms,
+		RMSDBFS:   dbfs,
+		Top:       top[:],
+		Embedding: emb,
 	}, nil
 }
 
@@ -743,13 +752,33 @@ func (e *Engine) invoke() error {
 			ch := t0.shape[3]
 			rescale := t0.scales[0] / (tout.scales[0] * float32(hw))
 			inZP, outZP := t0.zp, tout.zp
+			var maxAbs int32
+			var sums [1024]int32
 			for c := 0; c < ch; c++ {
 				var sum int32
 				for p := 0; p < hw; p++ {
 					sum += int32(t0.i8[p*ch+c]) - inZP
 				}
+				if c < len(sums) {
+					sums[c] = sum
+					a := sum
+					if a < 0 {
+						a = -a
+					}
+					if a > maxAbs {
+						maxAbs = a
+					}
+				}
 				q := roundToNearest(float32(sum)*rescale) + outZP
 				tout.i8[c] = int8(clampI32(q, -128, 127))
+			}
+			if ch == len(e.lastEmbed) && maxAbs > 0 {
+				inv := 127.0 / float32(maxAbs)
+				for c := 0; c < len(e.lastEmbed); c++ {
+					v := clampI32(roundToNearest(float32(sums[c])*inv), -127, 127)
+					e.lastEmbed[c] = byte(int8(v))
+				}
+				e.hasEmbed = true
 			}
 
 		case opLogistic:

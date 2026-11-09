@@ -18,7 +18,7 @@ jobs:
         with:
           go-version: '1.24.x'
 
-      - name: Verify Tests & QEMU ARMv7 Assembly
+      - name: Verify Tests & QEMU ARMv7 + ARM64 Assembly
         run: |
           go vet ./...
           go test -race -v ./...
@@ -26,6 +26,9 @@ jobs:
           CGO_ENABLED=0 GOOS=linux GOARCH=arm GOARM=7 go test -c -o sound-arm.test ./internal/sound
           qemu-arm ./sound-arm.test -test.v -test.run=TestDot4I8BoundaryAndTailLengths
           rm -f sound-arm.test
+          CGO_ENABLED=0 GOOS=linux GOARCH=arm64 go test -c -o sound-arm64.test ./internal/sound
+          qemu-aarch64 ./sound-arm64.test -test.v -test.run=TestDot4I8BoundaryAndTailLengths
+          rm -f sound-arm64.test
 
       - name: Build Release Binaries & SHA256SUMS
         run: |

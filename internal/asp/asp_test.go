@@ -431,3 +431,57 @@ func BenchmarkProcessorProcess(b *testing.B) {
 		proc.Process(in, out)
 	}
 }
+
+func TestProcessorPlaybackActiveTagging(t *testing.T) {
+	frames := uint32(320)
+	stride := uint32(4)
+	length := frames * stride
+	descBytes := encodeTestDescriptor(
+		[]Buffer{{
+			Offset: 0, Length: length, SampleRate: 16000, Frames: frames, Stride: stride,
+			Format: FormatS16, ValidBits: 16, Channels: 2,
+		}},
+		[]Channel{
+			{BufferIndex: 0, Role: RoleMIC, RoleIndex: 0, FrameOffset: 0},
+			{BufferIndex: 0, Role: RoleREF, RoleIndex: 0, FrameOffset: 2},
+		},
+	)
+
+	// 1. Silent reference channel -> PlaybackActive() == false, sink receives 640 bytes
+	silentFrame := make([]byte, length)
+	for f := 0; f < int(frames); f++ {
+		binary.LittleEndian.PutUint16(silentFrame[f*4:], uint16(1000)) // MIC only, REF = 0
+	}
+	// 2. Active reference channel (RMS > 180) -> PlaybackActive() == true, sink receives 642 bytes with pkt[640]==1
+	activeFrame := make([]byte, length)
+	for f := 0; f < int(frames); f++ {
+		binary.LittleEndian.PutUint16(activeFrame[f*4:], uint16(1000))
+		binary.LittleEndian.PutUint16(activeFrame[f*4+2:], uint16(4000)) // REF = 4000 > 180
+	}
+
+	var in bytes.Buffer
+	in.Write(descBytes)
+	in.Write(silentFrame)
+	in.Write(activeFrame)
+
+	var out bytes.Buffer
+	var sinkFrames [][]byte
+	if err := Run(&in, &out, "", func(b []byte) {
+		sinkFrames = append(sinkFrames, append([]byte(nil), b...))
+	}); err != nil {
+		t.Fatalf("Run failed: %v", err)
+	}
+	if out.Len() != 1+2*OutputBytes {
+		t.Fatalf("stdout len = %d, want %d (must never include playback tag bytes)", out.Len(), 1+2*OutputBytes)
+	}
+	if len(sinkFrames) != 2 {
+		t.Fatalf("sinkFrames len = %d, want 2", len(sinkFrames))
+	}
+	if len(sinkFrames[0]) != OutputBytes {
+		t.Fatalf("silent ref frame len = %d, want %d", len(sinkFrames[0]), OutputBytes)
+	}
+	if len(sinkFrames[1]) != OutputBytes+2 || sinkFrames[1][OutputBytes] != 1 {
+		t.Fatalf("active ref frame len = %d, tag = %d, want len=%d tag=1", len(sinkFrames[1]), sinkFrames[1][OutputBytes], OutputBytes+2)
+	}
+}
+

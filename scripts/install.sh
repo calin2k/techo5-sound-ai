@@ -6,8 +6,8 @@
 #   On device:        sh install.sh
 set -eu
 
-REPO_RELEASE_URL="https://github.com/calin2k/techo5-sound-ai/releases/latest/download/techo5-sound-ai-linux-arm"
-REPO_SHA256_URL="https://github.com/calin2k/techo5-sound-ai/releases/latest/download/SHA256SUMS"
+REPO_BASE_URL="https://github.com/calin2k/techo5-sound-ai/releases/latest/download"
+REPO_SHA256_URL="$REPO_BASE_URL/SHA256SUMS"
 YAMNET_URL="https://storage.googleapis.com/mediapipe-models/audio_classifier/yamnet/float32/1/yamnet.tflite"
 
 install_on_device() {
@@ -65,11 +65,19 @@ EOF
 
 if [ "${1:-}" != "" ]; then
 	HOST="$1"
-	BIN="techo5-sound-ai-linux-arm"
-	if [ ! -f "$BIN" ]; then
-		echo "Building $BIN..."
-		GOOS=linux GOARCH=arm GOARM=7 CGO_ENABLED=0 go build -tags nethttpomithttp2 -trimpath -ldflags="-s -w" -o "$BIN" ./cmd/techo5-sound-ai
-	fi
+	ARCH=$(ssh "root@$HOST" 'uname -m' 2>/dev/null || echo "armv7l")
+	case "$ARCH" in
+		aarch64|arm64)
+			BIN="techo5-sound-ai-linux-arm64"
+			echo "Detected 64-bit ARM ($ARCH) kernel on $HOST; building $BIN..."
+			GOOS=linux GOARCH=arm64 CGO_ENABLED=0 go build -tags nethttpomithttp2 -trimpath -ldflags="-s -w" -o "$BIN" ./cmd/techo5-sound-ai
+			;;
+		*)
+			BIN="techo5-sound-ai-linux-arm"
+			echo "Detected 32-bit ARM ($ARCH) kernel on $HOST; building $BIN..."
+			GOOS=linux GOARCH=arm GOARM=7 CGO_ENABLED=0 go build -tags nethttpomithttp2 -trimpath -ldflags="-s -w" -o "$BIN" ./cmd/techo5-sound-ai
+			;;
+	esac
 	echo "Uploading to root@$HOST:/data/techo5-sound-ai/techo5-sound-ai..."
 	ssh "root@$HOST" 'mkdir -p /data/techo5-sound-ai && if [ -f /run/techo5-sound-ai.lock ]; then kill $(cat /run/techo5-sound-ai.lock) 2>/dev/null || true; fi'
 	cat "$BIN" | ssh "root@$HOST" 'cat > /data/techo5-sound-ai/techo5-sound-ai.new && mv -f /data/techo5-sound-ai/techo5-sound-ai.new /data/techo5-sound-ai/techo5-sound-ai'
@@ -80,10 +88,15 @@ fi
 
 # Running directly on the TECHO5 device
 mkdir -p /data/techo5-sound-ai
-echo "Downloading latest techo5-sound-ai binary..."
-wget -O /data/techo5-sound-ai/techo5-sound-ai.new "$REPO_RELEASE_URL"
+ARCH=$(uname -m 2>/dev/null || echo "armv7l")
+case "$ARCH" in
+	aarch64|arm64) ASSET="techo5-sound-ai-linux-arm64" ;;
+	*)             ASSET="techo5-sound-ai-linux-arm" ;;
+esac
+echo "Downloading latest $ASSET binary for $ARCH..."
+wget -O /data/techo5-sound-ai/techo5-sound-ai.new "$REPO_BASE_URL/$ASSET"
 if command -v sha256sum >/dev/null 2>&1 && wget -qO /tmp/techo5-sound-ai.sha256 "$REPO_SHA256_URL" 2>/dev/null; then
-	expected=$(awk '/techo5-sound-ai-linux-arm$/ {print $1}' /tmp/techo5-sound-ai.sha256)
+	expected=$(awk -v a="$ASSET" '$2 == a {print $1}' /tmp/techo5-sound-ai.sha256)
 	rm -f /tmp/techo5-sound-ai.sha256
 	if [ -n "$expected" ]; then
 		actual=$(sha256sum /data/techo5-sound-ai/techo5-sound-ai.new | awk '{print $1}')

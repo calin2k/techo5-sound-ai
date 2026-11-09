@@ -21,6 +21,8 @@ type Config struct {
 	CooldownSec   int                `json:"cooldown_sec"`
 	Alerts        []string           `json:"alerts,omitempty"`
 	CategoryMin   map[string]float64 `json:"category_min,omitempty"`
+	PlaybackGuard bool               `json:"playback_guard"`
+	CustomSounds  []CustomSound      `json:"custom_sounds,omitempty"`
 
 	// Home Assistant HTTP notification (Webhook URL and/or HA Base URL + Token + Service)
 	HAWebhookURL string `json:"ha_webhook_url,omitempty"`
@@ -48,6 +50,7 @@ func DefaultConfig(devName string) Config {
 		MinConfidence: 0.25,
 		CooldownSec:   15,
 		Alerts:        append([]string(nil), DefaultAlertCategories...),
+		PlaybackGuard: true,
 		MQTTDiscovery: true,
 	}
 }
@@ -84,6 +87,9 @@ var AlertChoices = []AlertChoice{
 
 // AlertEnabled reports whether category is selected in sc.Alerts (or DefaultAlertCategories when nil).
 func AlertEnabled(sc Config, category string) bool {
+	if strings.HasPrefix(category, "custom_") {
+		return true
+	}
 	list := sc.Alerts
 	if list == nil {
 		list = DefaultAlertCategories
@@ -488,9 +494,26 @@ func (c *MQTTClient) Publish(sc Config, devName string, det Detection, rep Engin
 			"icon":                  "mdi:bell-ring",
 			"device":                devBlock,
 		})
+		offDelay := sc.CooldownSec
+		if offDelay <= 0 {
+			offDelay = 15
+		}
+		discBinAlert, _ := json.Marshal(map[string]any{
+			"name":                  "Sound alert",
+			"unique_id":             node + "_sound_alert_bin_mqtt",
+			"state_topic":           prefix + "/alert_active",
+			"payload_on":            "ON",
+			"payload_off":           "OFF",
+			"off_delay":             offDelay,
+			"device_class":          "sound",
+			"json_attributes_topic": prefix + "/alert_event",
+			"availability_topic":    availTopic,
+			"device":                devBlock,
+		})
 		msgs = append(msgs,
 			mqttMsg{topic: "homeassistant/sensor/" + node + "_room_sound/config", payload: discSensor, retain: true},
 			mqttMsg{topic: "homeassistant/sensor/" + node + "_last_sound_alert/config", payload: discAlertSensor, retain: true},
+			mqttMsg{topic: "homeassistant/binary_sensor/" + node + "_sound_alert/config", payload: discBinAlert, retain: true},
 		)
 	}
 	msgs = append(msgs,
@@ -501,6 +524,11 @@ func (c *MQTTClient) Publish(sc Config, devName string, det Detection, rep Engin
 		msgs = append(msgs,
 			mqttMsg{topic: prefix + "/last_alert", payload: []byte(det.Label), retain: true},
 			mqttMsg{topic: prefix + "/alert_event", payload: eventPayload, retain: true},
+			mqttMsg{topic: prefix + "/alert_active", payload: []byte("ON"), retain: false},
+		)
+	} else if det.Category == "quiet" {
+		msgs = append(msgs,
+			mqttMsg{topic: prefix + "/alert_active", payload: []byte("OFF"), retain: false},
 		)
 	}
 	for _, m := range msgs {

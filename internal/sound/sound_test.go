@@ -830,7 +830,7 @@ func TestPersistentMQTTClientLWTAndConnectionReuse(t *testing.T) {
 		t.Fatalf("1st Publish: %v", err)
 	}
 	// 2nd publish reuses the exact same TCP connection without reconnecting
-	if err := cli.Publish(sc, "Hall Show", det, rep, false, false); err != nil {
+	if err := cli.Publish(sc, "Hall Show", Detection{Category: "quiet", Label: "Quiet"}, rep, false, false); err != nil {
 		t.Fatalf("2nd Publish: %v", err)
 	}
 	// Close publishes retained "offline" availability and disconnects
@@ -849,5 +849,89 @@ func TestPersistentMQTTClientLWTAndConnectionReuse(t *testing.T) {
 	if last.topic != "techo5/hall_show/sound/availability" || last.payload != "offline" || !last.retain {
 		t.Fatalf("expected final publish on Close() to be retained offline availability, got %+v", last)
 	}
+	var sawBinSensorDisc, sawAlertON, sawAlertOFF bool
+	for _, p := range pubs {
+		if p.topic == "homeassistant/binary_sensor/hall_show_sound_alert/config" && p.retain {
+			sawBinSensorDisc = true
+		}
+		if p.topic == "techo5/hall_show/sound/alert_active" && p.payload == "ON" {
+			sawAlertON = true
+		}
+		if p.topic == "techo5/hall_show/sound/alert_active" && p.payload == "OFF" {
+			sawAlertOFF = true
+		}
+	}
+	if !sawBinSensorDisc || !sawAlertON || !sawAlertOFF {
+		t.Fatalf("expected binary_sensor discovery and ON/OFF alert_active states: disc=%v on=%v off=%v", sawBinSensorDisc, sawAlertON, sawAlertOFF)
+	}
 }
+
+func TestEmbeddingSimilarityAndLearnMatchCustomSound(t *testing.T) {
+	// 1. EmbeddingSimilarity edge cases
+	if sim := EmbeddingSimilarity(nil, nil); sim != 0 {
+		t.Fatalf("nil similarity = %v, want 0", sim)
+	}
+	zero := make([]byte, 1024)
+	if sim := EmbeddingSimilarity(zero, zero); sim != 0 {
+		t.Fatalf("zero vector similarity = %v, want 0", sim)
+	}
+
+	vecA := make([]byte, 1024)
+	vecB := make([]byte, 1024)
+	vecOpp := make([]byte, 1024)
+	s8 := func(v int8) byte { return byte(v) }
+	for i := 0; i < 1024; i++ {
+		if i%2 == 0 {
+			vecA[i] = s8(60)
+			vecB[i] = s8(58)
+			vecOpp[i] = s8(-60)
+		} else {
+			vecA[i] = s8(-40)
+			vecB[i] = s8(-42)
+			vecOpp[i] = s8(40)
+		}
+	}
+	if sim := EmbeddingSimilarity(vecA, vecA); sim < 0.999 {
+		t.Fatalf("self similarity = %v, want ~1.0", sim)
+	}
+	if sim := EmbeddingSimilarity(vecA, vecOpp); sim != 0 {
+		t.Fatalf("opposite vector similarity = %v, want 0", sim)
+	}
+
+	// 2. LearnCustomSound validation + 1-shot & 2-shot prototype averaging
+	if _, _, err := LearnCustomSound(nil, "", 0.82, vecA); err == nil {
+		t.Fatal("expected error for empty custom sound name")
+	}
+	if _, _, err := LearnCustomSound(nil, "Kettle", 0.82, nil); err == nil {
+		t.Fatal("expected error for short embedding")
+	}
+
+	var list []CustomSound
+	var cs CustomSound
+	var err error
+	list, cs, err = LearnCustomSound(list, "Kettle Whistle!", 0.84, vecA)
+	if err != nil || cs.Category != "custom_kettle_whistle" || cs.Samples != 1 || len(list) != 1 {
+		t.Fatalf("1-shot LearnCustomSound: cs=%+v len=%d err=%v", cs, len(list), err)
+	}
+	list, cs, err = LearnCustomSound(list, "Kettle Whistle!", 0.84, vecB)
+	if err != nil || cs.Samples != 2 || len(list) != 1 {
+		t.Fatalf("2-shot LearnCustomSound: cs=%+v len=%d err=%v", cs, len(list), err)
+	}
+
+	// 3. MatchCustomSound matches vecA against learned prototype
+	det, ok := MatchCustomSound(vecA, list)
+	if !ok || det.Category != "custom_kettle_whistle" || det.Label != "Kettle Whistle!" || !det.Actionable {
+		t.Fatalf("expected MatchCustomSound to match Kettle Whistle, got ok=%v det=%+v", ok, det)
+	}
+	if _, ok := MatchCustomSound(vecOpp, list); ok {
+		t.Fatal("expected opposite embedding not to match custom sound")
+	}
+
+	// 4. AlertEnabled automatically enables custom_* categories unless explicitly listed
+	cfg := Config{}
+	if !AlertEnabled(cfg, "custom_kettle_whistle") {
+		t.Fatal("expected custom_* sound to be alert-enabled by default")
+	}
+}
+
 

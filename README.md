@@ -22,8 +22,9 @@ When you flash [TECHO5](https://github.com/HuskerMinion/techo5) onto an Amazon E
 `techo5-sound-ai` turns that idle microphone stream into a **100% local ambient sound sensor** without touching TECHO5's firmware or degrading wake-word responsiveness:
 
 - **Zero Cloud, Zero External Dependencies:** Runs Google's `yamnet.tflite` (`3.94 MiB`, `521` classes mapped into `21` household categories such as `Doorbell`, `Baby cry`, `Dog`, `Cat`, `Glass breaking`, `Siren`, `Smoke / fire alarm`, `Appliance beep`, `Knock`, `Cough`) directly on the device CPU. No audio or telemetry ever leaves your LAN.
-- **Non-Intrusive `ASP1` Audio Tee:** Hooks into `/data/techo5-linux/external-asp/bin/external-asp`. If you already use an upstream `external-asp` binary, `techo5-sound-ai` preserves it as `external-asp.orig`, chains to it transparently, and tees `16 kHz` mono PCM frames over a non-blocking Unix datagram socket (`/run/techo5-sound-ai.sock`). If no upstream `external-asp` exists, it performs boxcar anti-aliased `48 kHz -> 16 kHz` decimation and 64-tap NLMS acoustic echo cancellation in **`8.2 µs` per `20 ms` frame** with **`0` heap allocations**.
-- **Turnkey Home Assistant Integration:** Built-in **persistent MQTT v3.1.1 client with LWT availability (`online`/`offline`) and Home Assistant Auto-Discovery** (automatically registers `sensor.<device>_room_sound` and `sensor.<device>_last_sound_alert`), plus direct **Home Assistant Webhook** and **REST Service** (`notify.*`, `persistent_notification.create`) push alerts, per-category sensitivity presets, in-RAM last-alert audio playback (`/api/last-alert.wav`), and a self-contained Web UI on port `:8182`.
+- **Few-Shot "Teach Custom Sound" (`1024-D` Embeddings):** Tap YAMNet's final `1024-D` global average pooling bottleneck vector (`opMean`) to teach your own household sounds (e.g., your specific intercom buzzer, kettle whistle, washer chime, or baby monitor beep) in 1–3 clicks from the `:8182` Web UI using cosine-similarity prototype matching — with zero cloud retraining.
+- **Non-Intrusive `ASP1` Audio Tee + Self-Playback Guard:** Hooks into `/data/techo5-linux/external-asp/bin/external-asp`. If you already use an upstream `external-asp` binary, `techo5-sound-ai` preserves it as `external-asp.orig`, chains to it transparently, and tees `16 kHz` mono PCM frames over a non-blocking Unix datagram socket (`/run/techo5-sound-ai.sock`). If no upstream `external-asp` exists, it performs boxcar anti-aliased `48 kHz -> 16 kHz` decimation, 64-tap NLMS acoustic echo cancellation, and `RoleREF` speaker-playback tagging (`PlaybackGuard`) in **`8.2 µs` per `20 ms` frame** with **`0` heap allocations**, suppressing false alerts while the Echo's own speaker is playing media (while still allowing `Smoke / fire alarm`, `Siren`, and `Glass breaking` alerts through).
+- **Turnkey Home Assistant Integration:** Built-in **persistent MQTT v3.1.1 client with LWT availability (`online`/`offline`) and Home Assistant Auto-Discovery** (automatically registers `binary_sensor.<device>_sound_alert` with `device_class: sound` + `off_delay`, `sensor.<device>_room_sound`, and `sensor.<device>_last_sound_alert`), plus direct **Home Assistant Webhook** and **REST Service** (`notify.*`, `persistent_notification.create`) push alerts, per-category sensitivity presets, in-RAM last-alert audio playback (`/api/last-alert.wav`), and a self-contained Web UI on port `:8182`.
 
 ### Honest Limitations (What It Is Not)
 - **Not a life-safety device:** Microphone placement, room acoustics, and background media playback affect classification confidence.
@@ -64,13 +65,13 @@ A complete audit of every file added to a TECHO5 device (measured on an Echo Sho
 
 | Property | Specification / Measured Value |
 | :--- | :--- |
-| **Target Hardware** | TECHO5 devices (`ARMv7` / `GOARM=7`, tested on Echo Show 5 Gen 1 `checkers` `MT8163`) |
-| **Total On-Device Footprint** | **`10.06 MiB` on `/data`** (`6.13 MiB` binary + `3.94 MiB` model), **`0 B` on `/`** |
+| **Target Hardware** | TECHO5 devices (`ARM64` / `aarch64` & `ARMv7` / `GOARM=7`, tested on Echo Show 5 Gen 1 `checkers` `MT8163`) |
+| **Total On-Device Footprint** | **`9.78–10.06 MiB` on `/data`** (`5.84 MiB` `arm64` / `6.13 MiB` `arm` binary + `3.94 MiB` model), **`0 B` on `/`** |
 | **RAM Footprint** | **`< 1.5 MB` RSS** — TFLite FlatBuffer is mapped read-only via `mmap(PROT_READ, MAP_SHARED)` |
 | **Audio Input (`ASP1`)** | `16–48 kHz`, `1–16` channels, `S16_LE` / `S32_LE` / `F32_LE` -> `16 kHz` mono (`50 Hz` frame rate) |
 | **Idle CPU (Quiet Room)** | **`~1.2%` of 1 core (`~0.3%` total SoC)** via adaptive EMA noise-floor gate (`-68 dBFS` / `+4.5 dB`) |
-| **Active Inference Time** | **`~45 ms`** (`int8` TFLite w/ ARMv7 `MULA` assembly `dot4_arm.s`) / **`~360 ms`** (stock `float32` YAMNet) |
-| **Web UI & REST API** | `http://<device-ip>:8182/` (`GET /api/status`, `GET /api/last-alert.wav`, `POST /setup/sound`, `POST /setup/sound/model/download`) |
+| **Active Inference Time** | **`~45 ms`** (`int8` TFLite w/ `dot4_arm64.s` / `dot4_arm.s` assembly) / **`278.3 ms`** (`aarch64` on `MT8163`, down from `388.4 ms`) |
+| **Web UI & REST API** | `http://<device-ip>:8182/` (`GET /api/status`, `GET /api/last-alert.wav`, `POST /setup/sound`, `POST /setup/sound/custom/learn`) |
 | **Daemon Reliability** | Kernel `flock` liveness probe (`/run/techo5-sound-ai.lock`) + `256 KiB` bounded log rotation + SHA-256 verified release upgrades |
 
 ---
@@ -139,8 +140,8 @@ Measured via `go test -bench=. -benchmem ./internal/sound ./internal/asp`:
   - `FuzzLoadEngine`: Feeds mutated/corrupt FlatBuffer binaries (negative vtable offsets, out-of-bounds buffer indices, cyclic operator graphs, zero-scale quantization parameters) to verify `LoadEngineFromBytes` never panics or reads out-of-bounds.
   - `FuzzReadDescriptor` & `FuzzExtractSample`: Fuzzes `ASP1` wire headers (`> 65,536` frame caps, invalid format codes, truncated payloads).
   - `FuzzClassifyWithMin`: Fuzzes 521-class logit vectors (`NaN`, `+Inf`, `-Inf`, negative thresholds, malformed class labels).
-- **QEMU ARMv7 Assembly Verification (`internal/sound/dot4_arm.s`):**
-  - CI cross-compiles `internal/sound` with `GOOS=linux GOARCH=arm GOARM=7` and executes `TestDot4I8BoundaryAndTailLengths` under `qemu-arm`, verifying exact bit-for-bit parity between the 4x-unrolled ARM `MULA` assembly loop and the pure-Go reference across all vector lengths `0..64` (including `n % 4 != 0` tail paths and `-128 × -128` saturation).
+- **QEMU ARMv7 & ARM64 Assembly Verification (`internal/sound/dot4_arm.s`, `internal/sound/dot4_arm64.s`):**
+  - CI cross-compiles `internal/sound` for both `GOARCH=arm GOARM=7` and `GOARCH=arm64` and executes `TestDot4I8BoundaryAndTailLengths` under `qemu-arm` and `qemu-aarch64`, verifying exact bit-for-bit parity between the unrolled ARM `MULA` / ARM64 `MADD` assembly loops and the pure-Go reference across all vector lengths `0..64` (including `n % 8 != 0` tail paths and `-128 × -128` saturation).
 - **Race Detector & Fault-Injection Suite:**
   - Verified with `go test -race ./...`, including concurrent `scoreWindow` execution during live `ReloadModel` `mmap` swaps, simulated daemon `SIGKILL` stale-socket recovery via `flock`, slow-loris HTTP timeouts, and stalled Unix datagram peers (`< 1 ms` write deadline).
 - **Live Device Validation (Echo Show 5 Gen 1 `checkers`):**

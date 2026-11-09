@@ -176,13 +176,43 @@ func (d *Daemon) handleIndex(w http.ResponseWriter, r *http.Request) {
 	}
 	b.WriteString(`</div></div>`)
 
+	b.WriteString(`<div class="card"><h2><span>Teach Custom Sound (Few-Shot 1024-D Embedding)</span><span class="badge `)
+	if len(cfg.CustomSounds) > 0 {
+		b.WriteString(fmt.Sprintf(`ok">%d learned`, len(cfg.CustomSounds)))
+	} else {
+		b.WriteString(`">0 learned`)
+	}
+	b.WriteString(`</span></h2><p style="margin:0 0 10px;color:var(--muted);font-size:13px">Make a distinct household sound near the microphone (e.g. apartment intercom, dryer chime, appliance beep), then click <strong>Learn Last Sound</strong>. Repeat with the same name to average multiple samples.</p>`)
+	b.WriteString(`<form method="post" action="/setup/sound/custom/learn" style="display:flex;flex-wrap:wrap;gap:8px;align-items:center;margin:0"><input type="hidden" name="token" value="`)
+	b.WriteString(escTok)
+	b.WriteString(`"><input type="text" name="name" placeholder="e.g. Washing Machine or Intercom" style="flex:1;min-width:180px"><input type="number" name="threshold" step="0.01" min="0.50" max="0.98" value="0.80" style="width:90px" title="Cosine similarity threshold (0.50-0.98)"><button type="submit" class="primary">Learn Last Sound</button></form>`)
+	if len(cfg.CustomSounds) > 0 {
+		b.WriteString(`<table><thead><tr><th>Custom sound</th><th>Similarity threshold</th><th>Samples</th><th></th></tr></thead><tbody>`)
+		for _, cs := range cfg.CustomSounds {
+			b.WriteString(`<tr><td><strong>`)
+			b.WriteString(escHTML(cs.Name))
+			b.WriteString(fmt.Sprintf(`</strong></td><td>%.2f</td><td>%d</td><td style="text-align:right"><form method="post" action="/setup/sound/custom/delete" style="margin:0"><input type="hidden" name="token" value="`, cs.Threshold, cs.Samples))
+			b.WriteString(escTok)
+			b.WriteString(`"><input type="hidden" name="category" value="`)
+			b.WriteString(escHTML(cs.Category))
+			b.WriteString(`"><button type="submit" class="danger" style="padding:3px 8px;font-size:12px">Remove</button></form></td></tr>`)
+		}
+		b.WriteString(`</tbody></table>`)
+	}
+	b.WriteString(`</div>`)
+
 	b.WriteString(`<form method="post" action="/setup/sound"><input type="hidden" name="token" value="`)
 	b.WriteString(escTok)
-	b.WriteString(`"><div class="card"><h2>Classifier &amp; Alert Categories</h2><label style="display:flex;align-items:center;gap:8px;margin-bottom:14px;cursor:pointer"><input type="checkbox" name="enabled" value="1"`)
+	b.WriteString(`"><div class="card"><h2>Classifier &amp; Alert Categories</h2><label style="display:flex;align-items:center;gap:8px;margin-bottom:8px;cursor:pointer"><input type="checkbox" name="enabled" value="1"`)
 	if cfg.Enabled {
 		b.WriteString(` checked`)
 	}
-	b.WriteString(`><strong>Enable on-device room sound classification</strong></label><div class="grid2">`)
+	b.WriteString(`><strong>Enable on-device room sound classification</strong></label>`)
+	b.WriteString(`<label style="display:flex;align-items:center;gap:8px;margin-bottom:14px;cursor:pointer"><input type="checkbox" name="playback_guard" value="1"`)
+	if cfg.PlaybackGuard {
+		b.WriteString(` checked`)
+	}
+	b.WriteString(`><span><strong>Self-Playback Guard:</strong> Suppress non-emergency false alerts while the device speaker is playing media</span></label><div class="grid2">`)
 	b.WriteString(`<label class="row"><span class="lbl">Device name</span><input type="text" name="device_name" value="`)
 	b.WriteString(escHTML(cfg.DeviceName))
 	b.WriteString(`"></label>`)

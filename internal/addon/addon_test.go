@@ -662,3 +662,98 @@ func TestLastAlertWAVAndPerCategorySensitivityAndImpulsiveSingleHop(t *testing.T
 	}
 }
 
+func TestCustomSoundLearnDeleteAndPlaybackGuard(t *testing.T) {
+	dir := t.TempDir()
+	d, err := NewDaemon(filepath.Join(dir, "config.json"), filepath.Join(dir, "yamnet.tflite"), "")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer d.Close()
+	h := d.Handler()
+
+	// 1. Learning before any audio embedding is captured redirects with err=
+	learnForm := url.Values{
+		"token":     {d.token},
+		"name":      {"Kettle Whistle"},
+		"threshold": {"0.82"},
+	}
+	req := httptest.NewRequest(http.MethodPost, "/setup/sound/custom/learn", strings.NewReader(learnForm.Encode()))
+	req.Header.Set("Content-Type", "application/x-www-form-urlencoded")
+	rec := httptest.NewRecorder()
+	h.ServeHTTP(rec, req)
+	if !strings.Contains(rec.Header().Get("Location"), "err=") {
+		t.Fatalf("expected error before embedding exists, got %q", rec.Header().Get("Location"))
+	}
+
+	// 2. Feed a hop with a 1024-D embedding, then learn "Kettle Whistle"
+	emb := make([]byte, 1024)
+	for i := range emb {
+		emb[i] = byte(int8((i%40) - 20))
+	}
+	quietRep := sound.EngineReply{
+		MS:        18.0,
+		RMSDBFS:   -24.0,
+		Top:       []sound.TopClass{{ID: 494, Name: "Silence", Score: 0.90}},
+		Embedding: emb,
+	}
+	d.handleReplyWithPCM(quietRep, nil)
+	if !d.Status().HasEmbedding {
+		t.Fatal("expected HasEmbedding=true after hop with 1024-D embedding")
+	}
+
+	req = httptest.NewRequest(http.MethodPost, "/setup/sound/custom/learn", strings.NewReader(learnForm.Encode()))
+	req.Header.Set("Content-Type", "application/x-www-form-urlencoded")
+	rec = httptest.NewRecorder()
+	h.ServeHTTP(rec, req)
+	if !strings.Contains(rec.Header().Get("Location"), "msg=") || d.Status().CustomCount != 1 {
+		t.Fatalf("expected custom sound learn to succeed: loc=%q status=%+v", rec.Header().Get("Location"), d.Status())
+	}
+
+	// 3. Subsequent hop with matching embedding is promoted from Quiet to "Kettle Whistle"
+	d.handleReplyWithPCM(quietRep, nil)
+	if st := d.Status(); st.Current != "Kettle Whistle" || st.LastAlert != "Kettle Whistle" {
+		t.Fatalf("expected custom sound match to trigger Kettle Whistle alert, got %+v", st)
+	}
+
+	// 4. Delete custom sound via POST /setup/sound/custom/delete
+	delForm := url.Values{
+		"token":    {d.token},
+		"category": {"custom_kettle_whistle"},
+	}
+	req = httptest.NewRequest(http.MethodPost, "/setup/sound/custom/delete", strings.NewReader(delForm.Encode()))
+	req.Header.Set("Content-Type", "application/x-www-form-urlencoded")
+	rec = httptest.NewRecorder()
+	h.ServeHTTP(rec, req)
+	if d.Status().CustomCount != 0 {
+		t.Fatalf("expected CustomCount=0 after delete, got %d", d.Status().CustomCount)
+	}
+
+	// 5. PlaybackGuard suppresses low-confidence non-emergency alerts while SpeakerPlaying=true,
+	// but allows emergency alerts (smoke_alarm) through immediately.
+	d.SetSpeakerPlaying(true)
+	if !d.Status().SpeakerPlaying {
+		t.Fatal("expected SpeakerPlaying=true")
+	}
+	lowKnock := sound.EngineReply{
+		MS:      18.0,
+		RMSDBFS: -22.0,
+		Top:     []sound.TopClass{{ID: 353, Name: "Knock", Score: 0.35}},
+	}
+	d.handleReplyWithPCM(lowKnock, nil)
+	if st := d.Status(); st.LastAlert == "Knock" {
+		t.Fatalf("expected PlaybackGuard to suppress low-confidence Knock during playback, got %+v", st)
+	}
+
+	smokeRep := sound.EngineReply{
+		MS:      18.0,
+		RMSDBFS: -15.0,
+		Top:     []sound.TopClass{{ID: 393, Name: "Smoke detector, smoke alarm", Score: 0.45}},
+	}
+	d.handleReplyWithPCM(smokeRep, nil)
+	d.handleReplyWithPCM(smokeRep, nil)
+	if st := d.Status(); st.LastAlert != "Smoke / fire alarm" {
+		t.Fatalf("expected emergency Smoke / fire alarm to bypass PlaybackGuard, got %+v", st)
+	}
+}
+
+

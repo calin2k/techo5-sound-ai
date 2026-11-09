@@ -233,9 +233,16 @@ type Processor struct {
 	Leveling bool
 	gain     float32
 	floor    float32
-	w        [64]float32
-	x        [64]float32
-	pos      int
+	w              [64]float32
+	x              [64]float32
+	pos            int
+	playbackActive bool
+}
+
+// PlaybackActive reports whether the speaker loopback reference channels (RoleREF)
+// carried audible media playback in the most recent Process() call.
+func (p *Processor) PlaybackActive() bool {
+	return p != nil && p.playbackActive
 }
 
 func NewProcessor(d Descriptor) *Processor {
@@ -315,6 +322,8 @@ func (p *Processor) Process(in []byte, out []byte) {
 			refEnergy += int64(r) * int64(r)
 		}
 	}
+	// Speaker loopback RMS > 180 (~ -45 dBFS) indicates active media playback on the device speaker.
+	p.playbackActive = refCount > 0 && refEnergy > int64(OutputSamples)*32400
 
 	for i := 0; i < OutputSamples; i++ {
 		m := micSum[i] / int32(micCount)
@@ -417,7 +426,7 @@ func Run(in io.Reader, out io.Writer, origPath string, sink func([]byte)) error 
 
 	proc := NewProcessor(desc)
 	inBuf := make([]byte, desc.InputSize)
-	outBuf := make([]byte, OutputBytes)
+	outBuf := make([]byte, OutputBytes+2)
 
 	for {
 		if _, err := io.ReadFull(in, inBuf); err != nil {
@@ -426,12 +435,18 @@ func Run(in io.Reader, out io.Writer, origPath string, sink func([]byte)) error 
 			}
 			return err
 		}
-		proc.Process(inBuf, outBuf)
-		if _, err := out.Write(outBuf); err != nil {
+		proc.Process(inBuf, outBuf[:OutputBytes])
+		if _, err := out.Write(outBuf[:OutputBytes]); err != nil {
 			return err
 		}
 		if sink != nil {
-			sink(outBuf)
+			if proc.PlaybackActive() {
+				outBuf[OutputBytes] = 1
+				outBuf[OutputBytes+1] = 0
+				sink(outBuf[:OutputBytes+2])
+			} else {
+				sink(outBuf[:OutputBytes])
+			}
 		}
 	}
 }

@@ -1,4 +1,4 @@
-//go:build !arm || noasm
+//go:build (!arm && !arm64) || noasm
 
 package sound
 
