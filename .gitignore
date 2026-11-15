@@ -1,5 +1,6 @@
 /techo5-sound-ai
 /techo5-sound-ai-linux-arm
+/techo5-sound-ai-linux-arm64
 *.tflite
 *.test
 *.out

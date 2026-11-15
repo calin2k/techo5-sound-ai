@@ -28,7 +28,7 @@ import (
 )
 
 const (
-	Version       = "v1.4.1"
+	Version       = "v1.4.2"
 	WindowSamples = 15600 // 975 ms at 16 kHz
 	HopSamples    = 7680  // 480 ms hop (~50% overlap)
 

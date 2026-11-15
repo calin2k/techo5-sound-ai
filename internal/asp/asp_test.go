@@ -507,3 +507,165 @@ func TestProcessorPlaybackActiveTagging(t *testing.T) {
 	}
 }
 
+func TestProcessorLevelerHoldsGainDuringSilence(t *testing.T) {
+	frames := uint32(320)
+	stride := uint32(2)
+	length := frames * stride
+	descBytes := encodeTestDescriptor(
+		[]Buffer{{
+			Offset: 0, Length: length, SampleRate: 16000, Frames: frames, Stride: stride,
+			Format: FormatS16, ValidBits: 16, Channels: 1,
+		}},
+		[]Channel{{BufferIndex: 0, Role: RoleMIC, RoleIndex: 0, FrameOffset: 0}},
+	)
+	desc, err := ReadDescriptor(bytes.NewReader(descBytes))
+	if err != nil {
+		t.Fatal(err)
+	}
+	proc := NewProcessor(desc)
+
+	quietFrame := make([]byte, length)
+	speechFrame := make([]byte, length)
+	for f := 0; f < int(frames); f++ {
+		q := int16(25)
+		s := int16(2000)
+		if f%2 == 1 {
+			q = -q
+			s = -s
+		}
+		binary.LittleEndian.PutUint16(quietFrame[f*2:], uint16(q))
+		binary.LittleEndian.PutUint16(speechFrame[f*2:], uint16(s))
+	}
+	outPkt := make([]byte, OutputBytes)
+
+	// 1. Let room floor settle on quiet ambient noise (~25 LSB)
+	for i := 0; i < 150; i++ {
+		proc.Process(quietFrame, outPkt)
+	}
+	// 2. Normal speech (RMS 2000 -> target 2319 => gain ~1.16x) adapts gain down
+	for i := 0; i < 150; i++ {
+		proc.Process(speechFrame, outPkt)
+	}
+	speechGain := proc.gain
+	if speechGain > 1.5 {
+		t.Fatalf("expected speech to settle gain near ~1.16x, got %.3f", speechGain)
+	}
+
+	// 3. 10 seconds (500 frames) of quiet room background must NOT creep gain back up
+	for i := 0; i < 500; i++ {
+		proc.Process(quietFrame, outPkt)
+	}
+	if math.Abs(float64(proc.gain-speechGain)) > 0.01 {
+		t.Fatalf("expected gain to hold steady across silence (was %.4f, became %.4f)", speechGain, proc.gain)
+	}
+
+	// 4. Faint distant murmur (RMS 120, ~ -48.7 dBFS) is below minSpeechRMS and must NOT raise gain
+	murmurFrame := make([]byte, length)
+	for f := 0; f < int(frames); f++ {
+		m := int16(120)
+		if f%2 == 1 {
+			m = -m
+		}
+		binary.LittleEndian.PutUint16(murmurFrame[f*2:], uint16(m))
+	}
+	for i := 0; i < 300; i++ {
+		proc.Process(murmurFrame, outPkt)
+	}
+	if math.Abs(float64(proc.gain-speechGain)) > 0.01 {
+		t.Fatalf("expected faint murmur (RMS 120) not to raise gain (was %.4f, became %.4f)", speechGain, proc.gain)
+	}
+
+	// 5. Soft speech (RMS 260) may raise gain smoothly, but must never exceed maxLevelGain (+15 dB = 5.62x)
+	softSpeechFrame := make([]byte, length)
+	for f := 0; f < int(frames); f++ {
+		s := int16(260)
+		if f%2 == 1 {
+			s = -s
+		}
+		binary.LittleEndian.PutUint16(softSpeechFrame[f*2:], uint16(s))
+	}
+	for i := 0; i < 2000; i++ {
+		proc.Process(softSpeechFrame, outPkt)
+	}
+	if proc.gain > maxLevelGain+0.01 {
+		t.Fatalf("expected gain ceiling <= %.2f (+15 dB), got %.4f", maxLevelGain, proc.gain)
+	}
+}
+
+func TestProcessor1024TapDelayedEchoAndTailCancellation(t *testing.T) {
+	frames := uint32(320)
+	stride := uint32(4)
+	length := frames * stride
+	descBytes := encodeTestDescriptor(
+		[]Buffer{{
+			Offset: 0, Length: length, SampleRate: 16000, Frames: frames, Stride: stride,
+			Format: FormatS16, ValidBits: 16, Channels: 2,
+		}},
+		[]Channel{
+			{BufferIndex: 0, Role: RoleMIC, RoleIndex: 0, FrameOffset: 0},
+			{BufferIndex: 0, Role: RoleREF, RoleIndex: 0, FrameOffset: 2},
+		},
+	)
+	desc, err := ReadDescriptor(bytes.NewReader(descBytes))
+	if err != nil {
+		t.Fatal(err)
+	}
+	proc := NewProcessor(desc)
+	proc.Leveling = false
+
+	// Generate deterministic broadband reference and a 20 ms (320-sample) delayed echo,
+	// well past what a 64-tap (4 ms) filter could reach.
+	const delay = 320
+	const totalFrames = 65
+	refStream := make([]int16, totalFrames*OutputSamples)
+	var state uint32 = 0x12345678
+	for i := 0; i < 60*OutputSamples; i++ {
+		state ^= state << 13
+		state ^= state >> 17
+		state ^= state << 5
+		refStream[i] = int16(int32(state&0x3fff) - 8192)
+	}
+	// Frame 60 has ref == 0 (speaker stopped), while delayed echo from frame 59 still arrives!
+
+	inBuf := make([]byte, length)
+	outBuf := make([]byte, OutputBytes)
+	var firstEchoEnergy, convergedEnergy, tailInEnergy, tailOutEnergy float64
+
+	for blk := 0; blk <= 60; blk++ {
+		var rawMicEnergy float64
+		for f := 0; f < OutputSamples; f++ {
+			idx := blk*OutputSamples + f
+			ref := refStream[idx]
+			var mic int16
+			if idx >= delay {
+				mic = int16(float64(refStream[idx-delay]) * 0.6)
+			}
+			rawMicEnergy += float64(mic) * float64(mic)
+			binary.LittleEndian.PutUint16(inBuf[f*4:], uint16(mic))
+			binary.LittleEndian.PutUint16(inBuf[f*4+2:], uint16(ref))
+		}
+		proc.Process(inBuf, outBuf)
+		var outE float64
+		for f := 0; f < OutputSamples; f++ {
+			s := float64(int16(binary.LittleEndian.Uint16(outBuf[f*2:])))
+			outE += s * s
+		}
+		switch blk {
+		case 1: // First full block where the 320-sample delayed echo arrives
+			firstEchoEnergy = outE
+		case 59: // Converged steady-state echo cancellation
+			convergedEnergy = outE
+		case 60: // Post-playback silent REF block carrying the 20 ms echo tail
+			tailInEnergy = rawMicEnergy
+			tailOutEnergy = outE
+		}
+	}
+
+	if convergedEnergy >= firstEchoEnergy*0.05 {
+		t.Fatalf("expected >13 dB cancellation of 20 ms delayed echo: first=%v converged=%v", firstEchoEnergy, convergedEnergy)
+	}
+	if tailOutEnergy >= tailInEnergy*0.05 {
+		t.Fatalf("expected post-playback hold to cancel 20 ms echo tail: tailIn=%v tailOut=%v", tailInEnergy, tailOutEnergy)
+	}
+}
+

@@ -67,17 +67,27 @@ EOF
 
 if [ "${1:-}" != "" ]; then
 	HOST="$1"
+	run_go() {
+		if command -v go >/dev/null 2>&1; then
+			go "$@"
+		elif command -v mise >/dev/null 2>&1; then
+			mise x go@latest -- go "$@"
+		else
+			echo "ERROR: go toolchain not found" >&2
+			exit 1
+		fi
+	}
 	ARCH=$(ssh "root@$HOST" 'uname -m' 2>/dev/null || echo "armv7l")
 	case "$ARCH" in
 		aarch64|arm64)
 			BIN="techo5-sound-ai-linux-arm64"
 			echo "Detected 64-bit ARM ($ARCH) kernel on $HOST; building $BIN..."
-			GOOS=linux GOARCH=arm64 CGO_ENABLED=0 go build -tags nethttpomithttp2 -trimpath -ldflags="-s -w" -o "$BIN" ./cmd/techo5-sound-ai
+			GOOS=linux GOARCH=arm64 CGO_ENABLED=0 run_go build -tags nethttpomithttp2 -trimpath -ldflags="-s -w" -o "$BIN" ./cmd/techo5-sound-ai
 			;;
 		*)
 			BIN="techo5-sound-ai-linux-arm"
 			echo "Detected 32-bit ARM ($ARCH) kernel on $HOST; building $BIN..."
-			GOOS=linux GOARCH=arm GOARM=7 CGO_ENABLED=0 go build -tags nethttpomithttp2 -trimpath -ldflags="-s -w" -o "$BIN" ./cmd/techo5-sound-ai
+			GOOS=linux GOARCH=arm GOARM=7 CGO_ENABLED=0 run_go build -tags nethttpomithttp2 -trimpath -ldflags="-s -w" -o "$BIN" ./cmd/techo5-sound-ai
 			;;
 	esac
 	echo "Uploading to root@$HOST:/data/techo5-sound-ai/techo5-sound-ai..."

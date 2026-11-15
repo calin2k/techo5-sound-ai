@@ -39,6 +39,7 @@ func main() {
 	modelPath := flag.String("model", addon.DefaultModelPath, "path to yamnet.tflite model")
 	sockPath := flag.String("sock", asp.DefaultSocketPath, "Unix datagram socket path for PCM frames")
 	origASP := flag.String("orig-asp", defaultOrigASP, "optional upstream external-asp binary to chain")
+	mdnsFlag := flag.Bool("mdns", true, "advertise .local mDNS hostname (e.g. techo5.local) on LAN")
 	versionFlag := flag.Bool("version", false, "print version and exit")
 	flag.Parse()
 
@@ -77,6 +78,9 @@ func main() {
 	defer stop()
 
 	openFirewallPort(*listenAddr)
+	if *mdnsFlag {
+		go addon.RunMDNS(ctx)
+	}
 
 	srv := &http.Server{
 		Addr:              *listenAddr,

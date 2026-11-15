@@ -225,17 +225,50 @@ func clamp16(v int32) int16 {
 	return int16(v)
 }
 
+const (
+	// aecTaps is the NLMS adaptive echo canceller length at 16 kHz: 1024 taps (64 ms),
+	// matching TECHO5's built-in canceller so hardware delay and room reflections are covered.
+	aecTaps = 1024
+
+	// aecMu controls NLMS adaptation speed (0 < mu < 2). 0.12 converges rapidly on music/TTS
+	// while avoiding voice distortion during barge-in.
+	aecMu = 0.12
+
+	// aecQuiet is the per-tap normalized mean-square reference threshold (~ -60 dBFS) required
+	// before adapting filter weights, preventing weight drift during silent gaps.
+	aecQuiet = 1e-6
+
+	// aecReg bounds the NLMS step size when reference power is near aecQuiet.
+	aecReg = 1e-6
+
+	// aecHoldFrames keeps the echo canceller delay line active for 50 frames (1000 ms) after
+	// loopback reference audio drops below ~ -76 dBFS so reverberant room tails are still canceled.
+	aecHoldFrames = 50
+
+	// maxLevelGain caps digital AGC amplification at +15 dB (5.62x, down from +27 dB / 22.38x)
+	// so distant whispers or faint background speech across the room are never boosted into
+	// wake-word false-trigger territory.
+	maxLevelGain = 5.62
+
+	// minSpeechRMS requires ~ -42 dBFS raw frame RMS before the leveler adjusts gain, ignoring
+	// quiet ambient murmurs (-48 to -55 dBFS).
+	minSpeechRMS = 250.0
+)
+
 // Processor mixes multi-channel ASP1 buffers into 320-sample (20 ms @ 16 kHz) mono S16LE frames
-// and applies a lightweight 64-tap NLMS adaptive echo canceller when playback reference channels
+// and applies a 1024-tap (64 ms) NLMS adaptive echo canceller when playback reference channels
 // carry audio.
 type Processor struct {
-	desc     Descriptor
-	Leveling bool
-	gain     float32
-	floor    float32
-	w              [64]float32
-	x              [64]float32
+	desc           Descriptor
+	Leveling       bool
+	gain           float32
+	floor          float32
+	w              [aecTaps]float32
+	hist           [2 * aecTaps]float32
 	pos            int
+	pow            float32
+	since          int
+	aecHold        int
 	playbackActive bool
 	playbackHold   int
 }
@@ -250,7 +283,7 @@ func NewProcessor(d Descriptor) *Processor {
 	return &Processor{
 		desc:     d,
 		Leveling: true,
-		gain:     10.0, // +20 dB initial gain matching TECHO5's leveler
+		gain:     maxLevelGain, // +15 dB initial & ceiling gain
 		floor:    32768.0,
 	}
 }
@@ -335,46 +368,78 @@ func (p *Processor) Process(in []byte, out []byte) {
 		p.playbackActive = false
 	}
 
+	refActive := refCount > 0 && refEnergy > int64(OutputSamples)*27
+	if refActive {
+		p.aecHold = aecHoldFrames
+	} else if p.aecHold > 0 {
+		p.aecHold--
+	}
+
 	for i := 0; i < OutputSamples; i++ {
-		m := micSum[i] / int32(micCount)
-		if refCount > 0 && refEnergy > int64(OutputSamples)*64 {
+		micSum[i] /= int32(micCount)
+	}
+
+	if refCount > 0 && p.aecHold > 0 {
+		var cand [OutputSamples]int32
+		var dEnergy, eEnergy float64
+		for i := 0; i < OutputSamples; i++ {
 			r := float32(refSum[i]) / 32768.0
-			d := float32(m) / 32768.0
-			p.x[p.pos] = r
-			var y, norm float32
-			idx := p.pos
-			for k := 0; k < len(p.w); k++ {
-				xk := p.x[idx]
-				y += p.w[k] * xk
-				norm += xk * xk
-				if idx == 0 {
-					idx = len(p.x) - 1
-				} else {
-					idx--
+			d := float32(micSum[i]) / 32768.0
+
+			old := p.hist[p.pos]
+			p.hist[p.pos] = r
+			p.hist[p.pos+aecTaps] = r
+			p.pow += r*r - old*old
+
+			p.pos++
+			if p.pos == aecTaps {
+				p.pos = 0
+			}
+			win := p.hist[p.pos : p.pos+aecTaps : p.pos+aecTaps]
+
+			p.since++
+			if p.since >= aecTaps*16 || p.pow < 0 {
+				p.since = 0
+				var sum float32
+				for k := 0; k < aecTaps; k++ {
+					sum += win[k] * win[k]
 				}
+				p.pow = sum
+			}
+
+			var y float32
+			for k := 0; k < aecTaps; k++ {
+				y += p.w[k] * win[k]
 			}
 			e := d - y
-			if math.IsNaN(float64(e)) || math.IsInf(float64(e), 0) {
-				p.w = [64]float32{}
-				p.x = [64]float32{}
+			if math.IsNaN(float64(e)) || math.IsInf(float64(e), 0) || math.IsNaN(float64(p.pow)) || math.IsInf(float64(p.pow), 0) {
+				p.w = [aecTaps]float32{}
+				p.hist = [2 * aecTaps]float32{}
+				p.pos = 0
+				p.pow = 0
+				p.since = 0
 				e = d
-			} else {
-				mu := float32(0.08) / (norm + 1e-4)
-				idx = p.pos
-				for k := 0; k < len(p.w); k++ {
-					p.w[k] += mu * e * p.x[idx]
-					if idx == 0 {
-						idx = len(p.x) - 1
-					} else {
-						idx--
-					}
+			} else if refActive && p.pow > aecQuiet*aecTaps {
+				g := float32(aecMu) * e / (p.pow + aecReg*aecTaps)
+				for k := 0; k < aecTaps; k++ {
+					p.w[k] += g * win[k]
 				}
 			}
-			p.pos = (p.pos + 1) % len(p.x)
-			m = int32(e * 32768.0)
+			dEnergy += float64(d) * float64(d)
+			eEnergy += float64(e) * float64(e)
+			cand[i] = int32(clamp16(int32(e * 32768.0)))
 		}
-		s := clamp16(m)
-		micSum[i] = int32(s)
+		if refActive || eEnergy < dEnergy {
+			micSum = cand
+		} else {
+			for i := 0; i < OutputSamples; i++ {
+				micSum[i] = int32(clamp16(micSum[i]))
+			}
+		}
+	} else {
+		for i := 0; i < OutputSamples; i++ {
+			micSum[i] = int32(clamp16(micSum[i]))
+		}
 	}
 
 	if p.Leveling {
@@ -393,15 +458,15 @@ func (p *Processor) Process(in []byte, out []byte) {
 			stepFloor = 0.095
 		}
 		p.floor = max(p.floor+(rms-p.floor)*stepFloor, 16.0)
-		if rms > p.floor*3.98 && rms >= 120.0 {
-			want := min(max(2319.0/rms, 1.0), 22.38)
+		// Silence says nothing about speech loudness: hold gain where audible speech left it
+		// instead of creeping quiet room noise back up, and cap amplification at maxLevelGain (+15 dB).
+		if rms > p.floor*3.981 && rms >= minSpeechRMS {
+			want := min(max(2319.0/rms, 1.0), maxLevelGain)
 			stepGain := float32(0.004)
 			if want < p.gain {
 				stepGain = 0.039
 			}
 			p.gain += (want - p.gain) * stepGain
-		} else {
-			p.gain += (10.0 - p.gain) * 0.005
 		}
 		if peak > 0 {
 			p.gain = min(p.gain, 23197.0/peak)
